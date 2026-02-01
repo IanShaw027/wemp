@@ -24,7 +24,7 @@
 cd ~/.clawdbot/extensions
 
 # 克隆项目
-git clone https://github.com/YOUR_USERNAME/wechat-mp.git
+git clone https://github.com/IanShaw027/wechat-mp-clawdbot.git wechat-mp
 
 # 安装依赖并编译
 cd wechat-mp
