@@ -2,10 +2,10 @@
  * 微信公众号 Channel Plugin
  */
 import type { ChannelPlugin } from "openclaw/plugin-sdk";
-import type { ResolvedWechatMpAccount } from "./types.js";
+import type { ResolvedWechatMpAccount, WechatMpChannelConfig } from "./types.js";
 import { listWechatMpAccountIds, resolveWechatMpAccount, applyWechatMpAccountConfig } from "./config.js";
 import { sendText } from "./outbound.js";
-import { registerWechatMpWebhookTarget } from "./webhook-handler.js";
+import { registerWechatMpWebhookTarget, initPairingConfig } from "./webhook-handler.js";
 import { wechatMpOnboardingAdapter } from "./onboarding.js";
 import { getAccessToken } from "./api.js";
 
@@ -90,6 +90,12 @@ export const wechatMpPlugin: ChannelPlugin<ResolvedWechatMpAccount> = {
       const { account, abortSignal, log, cfg } = ctx;
 
       log?.info(`[wemp:${account.accountId}] Starting gateway (Webhook mode)`);
+
+      // 初始化配对配置
+      const channelCfg = cfg?.channels?.wemp as WechatMpChannelConfig | undefined;
+      if (channelCfg) {
+        initPairingConfig(channelCfg);
+      }
 
       // 验证配置
       if (!account.appId || !account.appSecret || !account.token) {

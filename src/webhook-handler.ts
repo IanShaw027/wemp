@@ -3,7 +3,7 @@
  * 支持配对功能和双 Agent 模式（客服模式 / 个人助理模式）
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { ResolvedWechatMpAccount, WechatMpMessage } from "./types.js";
+import type { ResolvedWechatMpAccount, WechatMpMessage, WechatMpChannelConfig } from "./types.js";
 import { verifySignature, processWechatMessage } from "./crypto.js";
 import { sendTypingStatus, sendCustomMessage } from "./api.js";
 import { getWechatMpRuntime } from "./runtime.js";
@@ -14,11 +14,28 @@ import {
   unpair,
   verifyPairingCode,
   getPairingApiToken,
+  setPairingApiToken,
 } from "./pairing.js";
 
-// Agent ID 配置
-const AGENT_ID_PAIRED = process.env.WEMP_AGENT_PAIRED || "main";  // 已配对用户使用的 agent
-const AGENT_ID_UNPAIRED = process.env.WEMP_AGENT_UNPAIRED || "wemp-cs";  // 未配对用户使用的 agent（客服模式）
+// Agent ID 配置（默认值，可被配置文件覆盖）
+let agentIdPaired = process.env.WEMP_AGENT_PAIRED || "main";
+let agentIdUnpaired = process.env.WEMP_AGENT_UNPAIRED || "wemp-cs";
+
+/**
+ * 初始化配对配置（从配置文件读取）
+ */
+export function initPairingConfig(cfg: WechatMpChannelConfig): void {
+  if (cfg.agentPaired) {
+    agentIdPaired = cfg.agentPaired;
+  }
+  if (cfg.agentUnpaired) {
+    agentIdUnpaired = cfg.agentUnpaired;
+  }
+  if (cfg.pairingApiToken) {
+    setPairingApiToken(cfg.pairingApiToken);
+  }
+  console.log(`[wemp] 配对配置: agentPaired=${agentIdPaired}, agentUnpaired=${agentIdUnpaired}`);
+}
 
 // 注册的 webhook 目标
 const webhookTargets = new Map<string, {
@@ -225,7 +242,7 @@ async function handleMessage(
 
     // 根据配对状态选择 agent
     const paired = isPaired(account.accountId, openId);
-    const agentId = paired ? AGENT_ID_PAIRED : AGENT_ID_UNPAIRED;
+    const agentId = paired ? agentIdPaired : agentIdUnpaired;
     console.log(`[wemp:${account.accountId}] 用户 ${openId} 使用 agent: ${agentId} (${paired ? "已配对" : "未配对"})`);
 
     // 构建 inbound 消息
@@ -254,7 +271,7 @@ async function handleMessage(
     // 语音消息如果有识别结果，当作文本处理
     if (msg.msgType === "voice" && msg.recognition) {
       const paired = isPaired(account.accountId, openId);
-      const agentId = paired ? AGENT_ID_PAIRED : AGENT_ID_UNPAIRED;
+      const agentId = paired ? agentIdPaired : agentIdUnpaired;
 
       const inbound = {
         channel: "wemp" as const,
@@ -334,7 +351,7 @@ async function handleSpecialCommand(
     const paired = isPaired(account.accountId, openId);
     const user = getPairedUser(account.accountId, openId);
     const mode = paired ? "🔓 完整模式（个人助理）" : "🔒 客服模式";
-    const agentId = paired ? AGENT_ID_PAIRED : AGENT_ID_UNPAIRED;
+    const agentId = paired ? agentIdPaired : agentIdUnpaired;
 
     let statusMsg = `当前状态: ${mode}\n`;
     statusMsg += `Agent: ${agentId}\n`;

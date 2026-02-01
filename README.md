@@ -225,13 +225,34 @@ wemp 支持两种工作模式：
 | `wemp-cs` | 客服模式，面向未配对的公众用户 | 限制工具使用，简洁回复 |
 | `main` | 个人助理，面向已配对的授权用户 | 完整工具权限 |
 
-#### 3. 自定义 Agent ID
+#### 3. 在配置文件中设置 Agent ID（推荐）
 
-如果你想使用不同的 Agent ID，可以通过环境变量配置：
+在 `~/.openclaw/openclaw.json` 的 `channels.wemp` 中添加配置：
+
+```json
+{
+  "channels": {
+    "wemp": {
+      "enabled": true,
+      "appId": "wx1234567890abcdef",
+      "appSecret": "your_app_secret",
+      "token": "your_token",
+      "agentPaired": "main",
+      "agentUnpaired": "wechat-cs",
+      "pairingApiToken": "your-secure-token"
+    }
+  }
+}
+```
+
+#### 4. 或通过环境变量配置
+
+如果你想使用环境变量而不是配置文件：
 
 ```bash
-export WEMP_AGENT_PAIRED=my-assistant      # 已配对用户使用的 Agent
-export WEMP_AGENT_UNPAIRED=my-customer-service  # 未配对用户使用的 Agent
+export WEMP_AGENT_PAIRED=main              # 已配对用户使用的 Agent
+export WEMP_AGENT_UNPAIRED=wechat-cs       # 未配对用户使用的 Agent
+export WEMP_PAIRING_API_TOKEN=your-token   # 配对 API Token
 ```
 
 ### 用户命令
@@ -265,7 +286,17 @@ Content-Type: application/json
 }
 ```
 
-### 环境变量配置
+### 配置项说明
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `agentPaired` | string | `main` | 已配对用户使用的 Agent ID |
+| `agentUnpaired` | string | `wemp-cs` | 未配对用户使用的 Agent ID |
+| `pairingApiToken` | string | `wemp-pairing-token` | 配对 API 验证 Token |
+
+### 环境变量配置（可选）
+
+环境变量会被配置文件中的值覆盖：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|

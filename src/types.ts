@@ -12,6 +12,10 @@ export interface WechatMpChannelConfig {
   name?: string;
   webhookPath?: string;
   accounts?: Record<string, WechatMpAccountConfig>;
+  // 配对功能配置
+  agentPaired?: string;      // 已配对用户使用的 Agent ID
+  agentUnpaired?: string;    // 未配对用户使用的 Agent ID
+  pairingApiToken?: string;  // 配对 API Token
 }
 
 export interface WechatMpAccountConfig {
