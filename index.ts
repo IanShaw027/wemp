@@ -3,7 +3,7 @@ import { wechatMpPlugin } from "./src/channel.js";
 import { setWechatMpRuntime } from "./src/runtime.js";
 import { handleWechatMpWebhookRequest } from "./src/webhook-handler.js";
 import { verifyPairingCode } from "./src/pairing.js";
-import { sendCustomMessage } from "./src/api.js";
+import { sendCustomMessage, createMenu, deleteMenu, getMenu, createOpenClawDefaultMenu } from "./src/api.js";
 import { resolveWechatMpAccount } from "./src/config.js";
 
 // 扩展 API 类型以包含 registerCommand
@@ -140,6 +140,84 @@ const plugin = {
         return {
           text: `✅ 配对成功！\n\n微信用户已绑定到你的账号。`,
         };
+      },
+    });
+
+    // 注册 /wemp-menu 命令，用于管理自定义菜单
+    extApi.registerCommand({
+      name: "wemp-menu",
+      description: "管理微信公众号自定义菜单 (用法: /wemp-menu create|delete|get)",
+      acceptsArgs: true,
+      requireAuth: true,
+      handler: async (ctx) => {
+        const args = ctx.args?.trim() || "";
+        const action = args.split(/\s+/)[0]?.toLowerCase();
+        const cfg = ctx.config || extApi.config;
+        const account = resolveWechatMpAccount(cfg, "default");
+
+        if (!account) {
+          return { text: "❌ 微信公众号未配置。" };
+        }
+
+        switch (action) {
+          case "create": {
+            const menu = createOpenClawDefaultMenu();
+            const result = await createMenu(account, menu);
+            if (result.success) {
+              return {
+                text: "✅ 自定义菜单创建成功！\n\n" +
+                  "菜单结构：\n" +
+                  "├─ 对话\n" +
+                  "│  ├─ 新对话 (/new)\n" +
+                  "│  ├─ 清除上下文 (/clear)\n" +
+                  "│  └─ 撤销上条 (/undo)\n" +
+                  "├─ 功能\n" +
+                  "│  ├─ 帮助 (/help)\n" +
+                  "│  ├─ 查看状态\n" +
+                  "│  └─ 配对账号\n" +
+                  "└─ 更多\n" +
+                  "   ├─ 模型信息 (/model)\n" +
+                  "   └─ 使用统计 (/usage)\n\n" +
+                  "注意：菜单可能需要 24 小时后才能在所有用户端显示。",
+              };
+            } else {
+              return { text: `❌ 创建菜单失败: ${result.error}` };
+            }
+          }
+
+          case "delete": {
+            const result = await deleteMenu(account);
+            if (result.success) {
+              return { text: "✅ 自定义菜单已删除。" };
+            } else {
+              return { text: `❌ 删除菜单失败: ${result.error}` };
+            }
+          }
+
+          case "get": {
+            const result = await getMenu(account);
+            if (result.success) {
+              return {
+                text: "当前菜单配置：\n\n" +
+                  "```json\n" +
+                  JSON.stringify(result.menu, null, 2) +
+                  "\n```",
+              };
+            } else {
+              return { text: `❌ 获取菜单失败: ${result.error}` };
+            }
+          }
+
+          default:
+            return {
+              text: "用法: /wemp-menu <action>\n\n" +
+                "可用操作：\n" +
+                "• create - 创建 OpenClaw 默认菜单\n" +
+                "• delete - 删除自定义菜单\n" +
+                "• get    - 查看当前菜单配置\n\n" +
+                "示例：/wemp-menu create",
+            };
+        }
       },
     });
   },

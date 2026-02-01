@@ -663,8 +663,8 @@ cat ~/.openclaw/data/wemp/paired-users.json
 - [x] 跨渠道配对
 - [x] 图片消息接收
 - [x] 图片消息回复
+- [x] 自定义菜单管理
 - [ ] 模板消息支持
-- [ ] 菜单管理
 - [ ] 多账号支持
 
 查看 [open issues](https://github.com/IanShaw027/wemp/issues) 了解更多计划中的功能和已知问题。

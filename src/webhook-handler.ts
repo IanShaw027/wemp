@@ -338,7 +338,7 @@ async function handleMessage(
 
   // 处理事件
   if (msg.msgType === "event") {
-    await handleEvent(account, msg, runtime);
+    await handleEvent(account, msg, runtime, cfg);
     return;
   }
 
@@ -827,7 +827,8 @@ async function handleSpecialCommand(
 async function handleEvent(
   account: ResolvedWechatMpAccount,
   msg: WechatMpMessage,
-  runtime: any
+  runtime: any,
+  cfg: any
 ): Promise<void> {
   const openId = msg.fromUserName;
 
@@ -843,7 +844,7 @@ async function handleEvent(
           "💡 小提示：\n" +
           "• 发送「配对」绑定账号，解锁完整功能\n" +
           "• 发送「状态」查看当前模式\n" +
-          "• 发送「解除配对」取消绑定";
+          "• 点击底部菜单使用更多功能";
       await sendCustomMessage(account, openId, welcomeMsg);
       break;
 
@@ -851,9 +852,84 @@ async function handleEvent(
       console.log(`[wemp:${account.accountId}] 用户取消关注: ${openId}`);
       break;
 
+    case "CLICK":
+      // 处理菜单点击事件
+      console.log(`[wemp:${account.accountId}] 菜单点击: ${msg.eventKey}, from=${openId}`);
+      await handleMenuClick(account, openId, msg.eventKey || "", runtime, cfg);
+      break;
+
     default:
       console.log(`[wemp:${account.accountId}] 未处理的事件: ${msg.event}`);
   }
+}
+
+/**
+ * 处理菜单点击事件
+ */
+async function handleMenuClick(
+  account: ResolvedWechatMpAccount,
+  openId: string,
+  eventKey: string,
+  runtime: any,
+  cfg: any
+): Promise<void> {
+  // 菜单命令映射
+  const menuCommands: Record<string, string> = {
+    CMD_NEW: "/new",
+    CMD_CLEAR: "/clear",
+    CMD_UNDO: "/undo",
+    CMD_HELP: "/help",
+    CMD_STATUS: "状态",
+    CMD_PAIR: "配对",
+    CMD_MODEL: "/model",
+    CMD_USAGE: "/usage",
+  };
+
+  const command = menuCommands[eventKey];
+  if (!command) {
+    console.log(`[wemp:${account.accountId}] 未知的菜单事件: ${eventKey}`);
+    return;
+  }
+
+  // 对于内置命令，模拟用户发送消息
+  console.log(`[wemp:${account.accountId}] 执行菜单命令: ${command}`);
+
+  // 检查是否是特殊命令（配对、状态等）
+  if (command === "配对" || command === "状态") {
+    await handleSpecialCommand(account, openId, command);
+    return;
+  }
+
+  // 对于 OpenClaw 内置命令，通过 dispatchControlCommand 处理
+  const dispatchControlCommand = runtime?.channel?.commands?.dispatchControlCommand;
+  const isControlCommandMessage = runtime?.channel?.commands?.isControlCommandMessage;
+
+  if (dispatchControlCommand && isControlCommandMessage) {
+    const isControlCmd = isControlCommandMessage(command, cfg);
+    if (isControlCmd) {
+      try {
+        const result = await dispatchControlCommand({
+          command,
+          cfg,
+          channel: "wemp",
+          accountId: account.accountId,
+          sessionKey: `wemp:${account.accountId}:${openId}`,
+          senderId: openId,
+          deliver: async (response: string) => {
+            await sendCustomMessage(account, openId, response);
+          },
+        });
+        if (result?.handled) {
+          return;
+        }
+      } catch (err) {
+        console.warn(`[wemp:${account.accountId}] 菜单命令处理失败:`, err);
+      }
+    }
+  }
+
+  // 如果命令未被处理，发送提示
+  await sendCustomMessage(account, openId, `命令 ${command} 暂不支持。`);
 }
 
 /**

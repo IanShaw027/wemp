@@ -377,3 +377,166 @@ export async function downloadImageToFile(
     return { success: false, error: String(error) };
   }
 }
+
+// ============ 自定义菜单 API ============
+
+/**
+ * 菜单按钮类型
+ */
+export interface MenuButton {
+  type?: "click" | "view" | "scancode_push" | "scancode_waitmsg" | "pic_sysphoto" | "pic_photo_or_album" | "pic_weixin" | "location_select" | "media_id" | "article_id" | "article_view_limited";
+  name: string;
+  key?: string;      // click 类型必填
+  url?: string;      // view 类型必填
+  media_id?: string; // media_id 类型必填
+  article_id?: string; // article_id 类型必填
+  sub_button?: MenuButton[]; // 子菜单
+}
+
+/**
+ * 菜单结构
+ */
+export interface Menu {
+  button: MenuButton[];
+}
+
+/**
+ * 创建自定义菜单
+ */
+export async function createMenu(
+  account: ResolvedWechatMpAccount,
+  menu: Menu
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/menu/create?access_token=${accessToken}`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(menu),
+    });
+
+    const data = await response.json() as { errcode?: number; errmsg?: string };
+
+    if (data.errcode && data.errcode !== 0) {
+      return { success: false, error: `${data.errcode} - ${data.errmsg}` };
+    }
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * 查询自定义菜单
+ */
+export async function getMenu(
+  account: ResolvedWechatMpAccount
+): Promise<{ success: boolean; menu?: any; error?: string }> {
+  try {
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/menu/get?access_token=${accessToken}`;
+
+    const response = await fetch(url);
+    const data = await response.json() as { menu?: any; errcode?: number; errmsg?: string };
+
+    if (data.errcode && data.errcode !== 0) {
+      return { success: false, error: `${data.errcode} - ${data.errmsg}` };
+    }
+
+    return { success: true, menu: data.menu };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * 删除自定义菜单
+ */
+export async function deleteMenu(
+  account: ResolvedWechatMpAccount
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/menu/delete?access_token=${accessToken}`;
+
+    const response = await fetch(url);
+    const data = await response.json() as { errcode?: number; errmsg?: string };
+
+    if (data.errcode && data.errcode !== 0) {
+      return { success: false, error: `${data.errcode} - ${data.errmsg}` };
+    }
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * 创建 OpenClaw 默认菜单
+ * 包含常用的内置命令
+ */
+export function createOpenClawDefaultMenu(): Menu {
+  return {
+    button: [
+      {
+        name: "对话",
+        sub_button: [
+          {
+            type: "click",
+            name: "新对话",
+            key: "CMD_NEW",
+          },
+          {
+            type: "click",
+            name: "清除上下文",
+            key: "CMD_CLEAR",
+          },
+          {
+            type: "click",
+            name: "撤销上条",
+            key: "CMD_UNDO",
+          },
+        ],
+      },
+      {
+        name: "功能",
+        sub_button: [
+          {
+            type: "click",
+            name: "帮助",
+            key: "CMD_HELP",
+          },
+          {
+            type: "click",
+            name: "查看状态",
+            key: "CMD_STATUS",
+          },
+          {
+            type: "click",
+            name: "配对账号",
+            key: "CMD_PAIR",
+          },
+        ],
+      },
+      {
+        name: "更多",
+        sub_button: [
+          {
+            type: "click",
+            name: "模型信息",
+            key: "CMD_MODEL",
+          },
+          {
+            type: "click",
+            name: "使用统计",
+            key: "CMD_USAGE",
+          },
+        ],
+      },
+    ],
+  };
+}
