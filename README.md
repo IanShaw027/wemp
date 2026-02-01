@@ -237,6 +237,9 @@ server {
 | `enabled` | boolean | 否 | 是否启用，默认 `true` |
 | `name` | string | 否 | 账户显示名称 |
 | `webhookPath` | string | 否 | Webhook 路径，默认 `/wemp` |
+| `articlesUrl` | string | 否 | 历史文章链接（菜单点击时发送） |
+| `websiteUrl` | string | 否 | 官网链接（菜单点击时发送） |
+| `contactInfo` | string | 否 | 联系信息（菜单点击时发送） |
 
 ## 使用
 
@@ -413,6 +416,11 @@ wemp 插件支持**双 Agent 模式**，这是一种安全的访问控制机制�
   }
 }
 ```
+
+**安全提醒（重要）**
+
+- `/wemp/api/pair` 配对 API 在强安全模式下**默认禁用**：你必须显式配置 `pairingApiToken`（或环境变量 `WEMP_PAIRING_API_TOKEN`）才能启用。
+- `pairingApiToken` 请使用足够长的随机字符串，并避免对公网暴露（推荐结合反向代理鉴权 + IP 白名单）。
 
 #### 3. 配置 `/pair` 命令权限（重要）
 
@@ -668,6 +676,137 @@ cat ~/.openclaw/data/wemp/paired-users.json
 - [ ] 多账号支持
 
 查看 [open issues](https://github.com/IanShaw027/wemp/issues) 了解更多计划中的功能和已知问题。
+
+<p align="right">(<a href="#微信公众号渠道插件-wemp">返回顶部</a>)</p>
+
+---
+
+## 自定义菜单
+
+### 概述
+
+wemp 插件支持微信公众号自定义菜单功能，可以在公众号底部显示快捷操作按钮。
+
+**默认菜单结构：**
+
+```
+├─ 内容
+│  ├─ 历史文章 (发送文章链接)
+│  └─ 访问官网 (发送官网链接)
+├─ AI助手
+│  ├─ 新对话 (/new)
+│  ├─ 清除上下文 (/clear)
+│  ├─ 帮助 (/help)
+│  ├─ 配对账号
+│  └─ 查看状态
+└─ 更多
+   ├─ 撤销上条 (/undo)
+   ├─ 模型信息 (/model)
+   └─ 使用统计 (/usage)
+```
+
+### 菜单管理命令
+
+在其他已授权渠道（如 Telegram）使用以下命令管理菜单：
+
+| 命令 | 说明 |
+|------|------|
+| `/wemp-menu create` | 创建/更新自定义菜单 |
+| `/wemp-menu delete` | 删除自定义菜单 |
+| `/wemp-menu get` | 查看当前菜单配置 |
+
+### 配置自定义链接
+
+在 `~/.openclaw/openclaw.json` 中配置你的链接：
+
+```json
+{
+  "channels": {
+    "wemp": {
+      "enabled": true,
+      "appId": "wx1234567890abcdef",
+      "appSecret": "your_app_secret",
+      "token": "your_token",
+      "webhookPath": "/wemp",
+
+      "articlesUrl": "https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz=YOUR_BIZ==&scene=124#wechat_redirect",
+      "websiteUrl": "https://your-website.com",
+      "contactInfo": "如需帮助，请发送邮件至 support@example.com"
+    }
+  }
+}
+```
+
+**配置说明：**
+
+| 配置项 | 说明 | 示例 |
+|--------|------|------|
+| `articlesUrl` | 历史文章链接 | 微信公众号文章列表 URL |
+| `websiteUrl` | 官网链接 | 你的网站地址 |
+| `contactInfo` | 联系信息 | 客服邮箱、电话等 |
+
+### 获取历史文章链接
+
+1. 打开微信公众号文章
+2. 点击公众号名称进入主页
+3. 点击右上角「...」→「复制链接」
+4. 将链接填入 `articlesUrl` 配置
+
+### 微信菜单限制
+
+由于微信安全策略，菜单中的 `view` 类型（直接跳转链接）有以下限制：
+
+- 不允许跳转到外部网站（非微信域名）
+- 只能跳转到微信相关页面（如公众号文章）
+
+因此，本插件使用 `click` 类型菜单，点击后通过消息发送链接给用户。
+
+### 完全自定义菜单
+
+如果需要完全自定义菜单结构，可以在配置中指定完整的菜单定义：
+
+```json
+{
+  "channels": {
+    "wemp": {
+      "menu": {
+        "button": [
+          {
+            "name": "我的服务",
+            "sub_button": [
+              { "type": "click", "name": "功能A", "key": "CMD_A" },
+              { "type": "click", "name": "功能B", "key": "CMD_B" }
+            ]
+          },
+          {
+            "name": "AI助手",
+            "sub_button": [
+              { "type": "click", "name": "新对话", "key": "CMD_NEW" },
+              { "type": "click", "name": "帮助", "key": "CMD_HELP" }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+**支持的菜单 key：**
+
+| Key | 对应命令 | 说明 |
+|-----|----------|------|
+| `CMD_NEW` | `/new` | 开始新对话 |
+| `CMD_CLEAR` | `/clear` | 清除上下文 |
+| `CMD_UNDO` | `/undo` | 撤销上条消息 |
+| `CMD_HELP` | `/help` | 显示帮助 |
+| `CMD_STATUS` | `状态` | 查看状态 |
+| `CMD_PAIR` | `配对` | 配对账号 |
+| `CMD_MODEL` | `/model` | 模型信息 |
+| `CMD_USAGE` | `/usage` | 使用统计 |
+| `CMD_ARTICLES` | - | 发送历史文章链接 |
+| `CMD_WEBSITE` | - | 发送官网链接 |
+| `CMD_CONTACT` | - | 发送联系信息 |
 
 <p align="right">(<a href="#微信公众号渠道插件-wemp">返回顶部</a>)</p>
 

@@ -205,19 +205,24 @@ export function listPairedUsers(): Record<string, PairedUser> {
   return loadPairedUsers();
 }
 
-// 配对 API Token（可通过配置文件设置）
-let pairingApiToken = process.env.WEMP_PAIRING_API_TOKEN || "wemp-pairing-token";
+// 配对 API Token（强安全：默认禁用，必须显式配置）
+// - 可通过环境变量 WEMP_PAIRING_API_TOKEN 设置（作为全局默认）
+// - 也可通过配置文件按 accountId 覆盖（见 setPairingApiToken）
+const pairingApiTokenByAccountId = new Map<string, string>();
+let defaultPairingApiToken: string | undefined = process.env.WEMP_PAIRING_API_TOKEN?.trim() || undefined;
 
 /**
  * 设置配对 API Token
  */
-export function setPairingApiToken(token: string): void {
-  pairingApiToken = token;
+export function setPairingApiToken(accountId: string, token: string): void {
+  const t = String(token || "").trim();
+  if (!t) return;
+  pairingApiTokenByAccountId.set(accountId, t);
 }
 
 /**
  * 获取配对 API Token（用于验证其他渠道的配对请求）
  */
-export function getPairingApiToken(): string {
-  return pairingApiToken;
+export function getPairingApiToken(accountId: string): string | undefined {
+  return pairingApiTokenByAccountId.get(accountId) ?? defaultPairingApiToken;
 }

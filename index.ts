@@ -3,7 +3,7 @@ import { wechatMpPlugin } from "./src/channel.js";
 import { setWechatMpRuntime } from "./src/runtime.js";
 import { handleWechatMpWebhookRequest } from "./src/webhook-handler.js";
 import { verifyPairingCode } from "./src/pairing.js";
-import { sendCustomMessage, createMenu, deleteMenu, getMenu, createOpenClawDefaultMenu } from "./src/api.js";
+import { sendCustomMessage, createMenu, deleteMenu, getMenu, createOpenClawDefaultMenu, createMenuFromConfig } from "./src/api.js";
 import { resolveWechatMpAccount } from "./src/config.js";
 
 // 扩展 API 类型以包含 registerCommand
@@ -54,11 +54,11 @@ const plugin = {
         // 如果配置了 pairAllowFrom，则检查发送者是否在列表中
         if (pairAllowFrom.length > 0) {
           const senderId = ctx.senderId || "";
+          const senderLower = senderId.trim().toLowerCase();
           const isAllowed = pairAllowFrom.some(entry => {
             const normalized = String(entry).trim().toLowerCase();
             return normalized === "*" ||
-                   normalized === senderId.toLowerCase() ||
-                   senderId.toLowerCase().includes(normalized);
+                   (senderLower.length > 0 && normalized === senderLower);
           });
 
           if (!isAllowed) {
@@ -161,24 +161,30 @@ const plugin = {
 
         switch (action) {
           case "create": {
-            const menu = createOpenClawDefaultMenu();
+            // 从配置读取菜单，支持自定义
+            const menu = createMenuFromConfig(cfg);
             const result = await createMenu(account, menu);
             if (result.success) {
+              // 生成菜单结构描述
+              const menuDesc = menu.button.map((btn, i) => {
+                const prefix = i === menu.button.length - 1 ? "└─" : "├─";
+                const childPrefix = i === menu.button.length - 1 ? "   " : "│  ";
+                let desc = `${prefix} ${btn.name}\n`;
+                if (btn.sub_button) {
+                  btn.sub_button.forEach((sub, j) => {
+                    const subPrefix = j === btn.sub_button!.length - 1 ? "└─" : "├─";
+                    const typeHint = sub.type === "view" ? `(${sub.url})` : sub.key ? `(${sub.key})` : "";
+                    desc += `${childPrefix}${subPrefix} ${sub.name} ${typeHint}\n`;
+                  });
+                }
+                return desc;
+              }).join("");
+
               return {
                 text: "✅ 自定义菜单创建成功！\n\n" +
                   "菜单结构：\n" +
-                  "├─ 对话\n" +
-                  "│  ├─ 新对话 (/new)\n" +
-                  "│  ├─ 清除上下文 (/clear)\n" +
-                  "│  └─ 撤销上条 (/undo)\n" +
-                  "├─ 功能\n" +
-                  "│  ├─ 帮助 (/help)\n" +
-                  "│  ├─ 查看状态\n" +
-                  "│  └─ 配对账号\n" +
-                  "└─ 更多\n" +
-                  "   ├─ 模型信息 (/model)\n" +
-                  "   └─ 使用统计 (/usage)\n\n" +
-                  "注意：菜单可能需要 24 小时后才能在所有用户端显示。",
+                  menuDesc + "\n" +
+                  "注意：取消关注再重新关注可立即看到新菜单，或等待最多 24 小时自动更新。",
               };
             } else {
               return { text: `❌ 创建菜单失败: ${result.error}` };
@@ -212,10 +218,11 @@ const plugin = {
             return {
               text: "用法: /wemp-menu <action>\n\n" +
                 "可用操作：\n" +
-                "• create - 创建 OpenClaw 默认菜单\n" +
+                "• create - 创建菜单（从配置读取或使用默认）\n" +
                 "• delete - 删除自定义菜单\n" +
                 "• get    - 查看当前菜单配置\n\n" +
-                "示例：/wemp-menu create",
+                "自定义菜单配置示例（openclaw.json）：\n" +
+                "channels.wemp.menu = { button: [...] }",
             };
         }
       },

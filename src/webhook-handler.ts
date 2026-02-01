@@ -3,6 +3,7 @@
  * 支持配对功能和双 Agent 模式（客服模式 / 个人助理模式）
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import * as crypto from "node:crypto";
 import type { ResolvedWechatMpAccount, WechatMpMessage, WechatMpChannelConfig } from "./types.js";
 import { verifySignature, processWechatMessage } from "./crypto.js";
 import { sendTypingStatus, sendCustomMessage, sendImageByUrl, downloadImageToFile } from "./api.js";
@@ -121,24 +122,45 @@ import {
 // 存储配置引用
 let storedConfig: any = null;
 
-// Agent ID 配置（默认值，可被配置文件覆盖）
-let agentIdPaired = process.env.WEMP_AGENT_PAIRED || "main";
-let agentIdUnpaired = process.env.WEMP_AGENT_UNPAIRED || "wemp-cs";
+// Agent ID 配置（默认值，可被配置文件覆盖；按 accountId 隔离）
+const DEFAULT_AGENT_PAIRED = process.env.WEMP_AGENT_PAIRED || "main";
+const DEFAULT_AGENT_UNPAIRED = process.env.WEMP_AGENT_UNPAIRED || "wemp-cs";
+const agentConfigByAccountId = new Map<string, { agentPaired: string; agentUnpaired: string }>();
+
+function getAgentConfig(accountId: string): { agentPaired: string; agentUnpaired: string } {
+  return (
+    agentConfigByAccountId.get(accountId) ?? {
+      agentPaired: DEFAULT_AGENT_PAIRED,
+      agentUnpaired: DEFAULT_AGENT_UNPAIRED,
+    }
+  );
+}
+
+function timingSafeEqualString(a: string, b: string): boolean {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
 
 /**
  * 初始化配对配置（从配置文件读取）
  */
-export function initPairingConfig(cfg: WechatMpChannelConfig): void {
-  if (cfg.agentPaired) {
-    agentIdPaired = cfg.agentPaired;
-  }
-  if (cfg.agentUnpaired) {
-    agentIdUnpaired = cfg.agentUnpaired;
-  }
+export function initPairingConfig(accountId: string, cfg: WechatMpChannelConfig): void {
+  const current = getAgentConfig(accountId);
+  agentConfigByAccountId.set(accountId, {
+    agentPaired: cfg.agentPaired || current.agentPaired,
+    agentUnpaired: cfg.agentUnpaired || current.agentUnpaired,
+  });
+
   if (cfg.pairingApiToken) {
-    setPairingApiToken(cfg.pairingApiToken);
+    setPairingApiToken(accountId, cfg.pairingApiToken);
   }
-  console.log(`[wemp] 配对配置: agentPaired=${agentIdPaired}, agentUnpaired=${agentIdUnpaired}`);
+
+  const finalCfg = getAgentConfig(accountId);
+  console.log(
+    `[wemp:${accountId}] 配对配置: agentPaired=${finalCfg.agentPaired}, agentUnpaired=${finalCfg.agentUnpaired}`
+  );
 }
 
 /**
@@ -161,6 +183,30 @@ const processingMessages = new Set<string>();
 // key: accountId:openId, value: { filePath, timestamp }
 const pendingImages = new Map<string, { filePath: string; timestamp: number }>();
 const PENDING_IMAGE_TIMEOUT = 5 * 60 * 1000; // 5 分钟过期
+
+const MAX_WEBHOOK_BODY_BYTES = 1 * 1024 * 1024; // 1MB (强安全)
+const MAX_PAIRING_API_BODY_BYTES = 32 * 1024; // 32KB (强安全)
+
+// /api/pair 简单限流（按 remoteAddress）
+const pairingApiRate = new Map<string, { count: number; resetAt: number }>();
+const PAIRING_API_RATE_LIMIT = { windowMs: 60_000, max: 30 };
+
+function checkPairingApiRateLimit(req: IncomingMessage): { ok: true } | { ok: false; retryAfterSec: number } {
+  const ip = req.socket?.remoteAddress || "unknown";
+  const now = Date.now();
+  const current = pairingApiRate.get(ip);
+  if (!current || now > current.resetAt) {
+    pairingApiRate.set(ip, { count: 1, resetAt: now + PAIRING_API_RATE_LIMIT.windowMs });
+    return { ok: true };
+  }
+
+  current.count += 1;
+  if (current.count > PAIRING_API_RATE_LIMIT.max) {
+    const retryAfterSec = Math.max(1, Math.ceil((current.resetAt - now) / 1000));
+    return { ok: false, retryAfterSec };
+  }
+  return { ok: true };
+}
 
 /**
  * 注册 Webhook 目标
@@ -260,7 +306,15 @@ async function handleRequest(
 
   // POST 请求 - 接收消息
   if (req.method === "POST") {
-    const rawBody = await readBody(req);
+    let rawBody = "";
+    try {
+      rawBody = await readBody(req, MAX_WEBHOOK_BODY_BYTES);
+    } catch (err) {
+      console.warn(`[wemp:${account.accountId}] 读取请求体失败: ${err}`);
+      res.statusCode = String(err).includes("too large") ? 413 : 400;
+      res.end("Bad Request");
+      return true;
+    }
 
     const result = processWechatMessage(account, rawBody, query);
     if (!result.success || !result.message) {
@@ -295,10 +349,21 @@ async function handleRequest(
 /**
  * 读取请求体
  */
-async function readBody(req: IncomingMessage): Promise<string> {
+async function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
+    let total = 0;
     req.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error(`Request body too large (limit=${maxBytes})`));
+        try {
+          req.destroy();
+        } catch {
+          // ignore
+        }
+        return;
+      }
       chunks.push(chunk);
     });
     req.on("end", () => {
@@ -326,7 +391,7 @@ async function handleMessage(
   }
 
   const openId = msg.fromUserName;
-  const msgKey = `${openId}:${msg.msgId || msg.createTime}`;
+  const msgKey = `${account.accountId}:${openId}:${msg.msgId || msg.createTime}`;
 
   // 防重复处理
   if (processingMessages.has(msgKey)) {
@@ -358,7 +423,8 @@ async function handleMessage(
 
     // 根据配对状态选择 agent
     const paired = isPaired(account.accountId, openId);
-    const agentId = paired ? agentIdPaired : agentIdUnpaired;
+    const agentCfg = getAgentConfig(account.accountId);
+    const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
     console.log(`[wemp:${account.accountId}] 用户 ${openId} 使用 agent: ${agentId} (${paired ? "已配对" : "未配对"})`);
 
     // 检查是否有待处理的图片
@@ -427,7 +493,8 @@ async function handleMessage(
     sendTypingStatus(account, openId).catch(() => {});
 
     const paired = isPaired(account.accountId, openId);
-    const agentId = paired ? agentIdPaired : agentIdUnpaired;
+    const agentCfg = getAgentConfig(account.accountId);
+    const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
     console.log(`[wemp:${account.accountId}] 用户 ${openId} 发送语音(识别), 使用 agent: ${agentId} (${paired ? "已配对" : "未配对"})`);
 
     await dispatchWempMessage({
@@ -803,7 +870,8 @@ async function handleSpecialCommand(
     const paired = isPaired(account.accountId, openId);
     const user = getPairedUser(account.accountId, openId);
     const mode = paired ? "🔓 完整模式（个人助理）" : "🔒 客服模式";
-    const agentId = paired ? agentIdPaired : agentIdUnpaired;
+    const agentCfg = getAgentConfig(account.accountId);
+    const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
 
     let statusMsg = `当前状态: ${mode}\n`;
     statusMsg += `Agent: ${agentId}\n`;
@@ -885,6 +953,26 @@ async function handleMenuClick(
     CMD_USAGE: "/usage",
   };
 
+  // 特殊菜单处理（发送链接）
+  const wempCfg = cfg?.channels?.wemp;
+  if (eventKey === "CMD_ARTICLES") {
+    const articlesUrl = wempCfg?.articlesUrl || "https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz=MzI0NTc0NTEwNQ==&scene=124#wechat_redirect";
+    await sendCustomMessage(account, openId, `📚 历史文章\n\n点击查看：${articlesUrl}`);
+    return;
+  }
+
+  if (eventKey === "CMD_WEBSITE") {
+    const websiteUrl = wempCfg?.websiteUrl || "https://kilan.cn";
+    await sendCustomMessage(account, openId, `🌐 官网\n\n访问：${websiteUrl}`);
+    return;
+  }
+
+  if (eventKey === "CMD_CONTACT") {
+    const contactInfo = wempCfg?.contactInfo || "如需帮助，请直接发送消息。";
+    await sendCustomMessage(account, openId, `📞 联系我们\n\n${contactInfo}`);
+    return;
+  }
+
   const command = menuCommands[eventKey];
   if (!command) {
     console.log(`[wemp:${account.accountId}] 未知的菜单事件: ${eventKey}`);
@@ -943,17 +1031,51 @@ async function handlePairingApi(
   account: ResolvedWechatMpAccount
 ): Promise<boolean> {
   try {
-    const rawBody = await readBody(req);
-    const body = JSON.parse(rawBody) as {
+    const rate = checkPairingApiRateLimit(req);
+    if (!rate.ok) {
+      res.statusCode = 429;
+      res.setHeader("Retry-After", String(rate.retryAfterSec));
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "Too Many Requests" }));
+      return true;
+    }
+
+    let rawBody = "";
+    try {
+      rawBody = await readBody(req, MAX_PAIRING_API_BODY_BYTES);
+    } catch (err) {
+      res.statusCode = String(err).includes("too large") ? 413 : 400;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "Bad Request" }));
+      return true;
+    }
+
+    let body: {
       code?: string;
       userId?: string;
       userName?: string;
       channel?: string;
       token?: string;
     };
+    try {
+      body = JSON.parse(rawBody) as any;
+    } catch {
+      res.statusCode = 400;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+      return true;
+    }
 
     // 验证 token
-    if (body.token !== getPairingApiToken()) {
+    const expectedToken = getPairingApiToken(account.accountId);
+    if (!expectedToken) {
+      // 强安全：没有显式配置则禁用此端点
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "Not Found" }));
+      return true;
+    }
+    if (!body.token || !timingSafeEqualString(body.token, expectedToken)) {
       res.statusCode = 401;
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ error: "Unauthorized" }));

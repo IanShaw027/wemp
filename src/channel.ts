@@ -122,7 +122,7 @@ export const wechatMpPlugin: ChannelPlugin<ResolvedWechatMpAccount> & { pairing?
       // 初始化配对配置
       const channelCfg = cfg?.channels?.wemp as WechatMpChannelConfig | undefined;
       if (channelCfg) {
-        initPairingConfig(channelCfg);
+        initPairingConfig(account.accountId, channelCfg);
       }
 
       // 存储配置引用

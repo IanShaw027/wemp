@@ -2,12 +2,191 @@
  * 微信公众号 API 封装
  */
 import type { ResolvedWechatMpAccount } from "./types.js";
+import * as crypto from "node:crypto";
+import * as dns from "node:dns/promises";
+import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
 
 // Access Token 缓存
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 
 // Media ID 缓存 (临时素材有效期 3 天)
 const mediaCache = new Map<string, { mediaId: string; expiresAt: number }>();
+
+const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB hard limit (防止内存/带宽滥用)
+const MAX_DATA_URL_BYTES = 3 * 1024 * 1024; // data URL 解码后最大 3MB
+
+type SafeFetchOptions = {
+  timeoutMs?: number;
+  maxBytes?: number;
+  redirect?: RequestRedirect;
+};
+
+function isProbablyFilePath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:\\/.test(value);
+}
+
+function isPrivateIp(ip: string): boolean {
+  const ipVersion = net.isIP(ip);
+  if (ipVersion === 4) {
+    const [a, b] = ip.split(".").map((x) => parseInt(x, 10));
+    if (Number.isNaN(a) || Number.isNaN(b)) return true;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+    if (a >= 224) return true; // multicast/reserved
+    return false;
+  }
+  if (ipVersion === 6) {
+    const normalized = ip.toLowerCase();
+    if (normalized === "::" || normalized === "::1") return true;
+    if (normalized.startsWith("fe80:")) return true; // link-local
+    if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true; // ULA fc00::/7
+    // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1)
+    const v4Mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (v4Mapped?.[1]) return isPrivateIp(v4Mapped[1]);
+    return false;
+  }
+  return true;
+}
+
+async function validateExternalUrl(rawUrl: string): Promise<URL> {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error("无效的 URL");
+  }
+
+  const protocol = url.protocol.toLowerCase();
+  if (protocol !== "http:" && protocol !== "https:") {
+    throw new Error("仅支持 http/https URL");
+  }
+
+  const hostname = url.hostname;
+  if (!hostname) throw new Error("无效的 URL 主机名");
+
+  // 明确拒绝 localhost 类
+  const lowerHost = hostname.toLowerCase();
+  if (lowerHost === "localhost" || lowerHost.endsWith(".localhost") || lowerHost.endsWith(".local")) {
+    throw new Error("禁止访问本地域名");
+  }
+
+  const ipLiteral = net.isIP(hostname) ? hostname : null;
+  if (ipLiteral) {
+    if (isPrivateIp(ipLiteral)) throw new Error("禁止访问内网/本地 IP");
+    return url;
+  }
+
+  // 对域名做 DNS 解析，拒绝解析到内网/本地地址（SSRF 防护）
+  const addrs = await dns.lookup(hostname, { all: true });
+  if (!addrs.length) throw new Error("DNS 解析失败");
+  for (const addr of addrs) {
+    if (isPrivateIp(addr.address)) {
+      throw new Error("禁止访问解析到内网/本地地址的域名");
+    }
+  }
+
+  return url;
+}
+
+async function safeFetch(url: string, init?: RequestInit, opts?: SafeFetchOptions): Promise<Response> {
+  const timeoutMs = opts?.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      redirect: opts?.redirect ?? "follow",
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readResponseBytesWithLimit(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength) {
+    const n = Number(contentLength);
+    if (Number.isFinite(n) && n > maxBytes) {
+      throw new Error(`响应体过大: ${n} bytes (limit=${maxBytes})`);
+    }
+  }
+
+  if (!response.body) {
+    // node-fetch/web fetch 可能在某些情况没有 body
+    const buf = new Uint8Array(await response.arrayBuffer());
+    if (buf.byteLength > maxBytes) throw new Error(`响应体过大 (limit=${maxBytes})`);
+    return buf;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        // ignore
+      }
+      throw new Error(`响应体过大 (limit=${maxBytes})`);
+    }
+    chunks.push(value);
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
+function inferImageExtFromContentType(contentType: string): string {
+  const ct = contentType.toLowerCase();
+  if (ct.includes("png")) return "png";
+  if (ct.includes("gif")) return "gif";
+  if (ct.includes("webp")) return "webp";
+  return "jpg";
+}
+
+function getDefaultWempImageDir(): string {
+  return path.join(os.homedir(), ".openclaw", "data", "wemp", "images");
+}
+
+async function resolveSafeLocalImagePath(inputPath: string): Promise<string> {
+  const fs = await import("node:fs/promises");
+  const real = await fs.realpath(inputPath);
+  const allowedBase = await fs.realpath(getDefaultWempImageDir()).catch(() => getDefaultWempImageDir());
+
+  const normalizedBase = allowedBase.endsWith(path.sep) ? allowedBase : allowedBase + path.sep;
+  if (!(real === allowedBase || real.startsWith(normalizedBase))) {
+    throw new Error("禁止读取非受控目录下的本地文件");
+  }
+  return real;
+}
+
+function timingSafeEqualString(a: string, b: string): boolean {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
 
 /**
  * 获取 Access Token
@@ -23,7 +202,7 @@ export async function getAccessToken(account: ResolvedWechatMpAccount): Promise<
 
   const url = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${account.appId}&secret=${account.appSecret}`;
 
-  const response = await fetch(url);
+  const response = await safeFetch(url, undefined, { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS });
   const data = await response.json() as { access_token?: string; expires_in?: number; errcode?: number; errmsg?: string };
 
   if (data.errcode) {
@@ -51,7 +230,9 @@ export async function sendCustomMessage(
     const accessToken = await getAccessToken(account);
     const url = `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${accessToken}`;
 
-    const response = await fetch(url, {
+    const response = await safeFetch(
+      url,
+      {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -59,7 +240,9 @@ export async function sendCustomMessage(
         msgtype: "text",
         text: { content },
       }),
-    });
+      },
+      { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+    );
 
     const data = await response.json() as { errcode?: number; errmsg?: string };
 
@@ -91,7 +274,7 @@ export async function uploadTempMedia(
       return { success: true, mediaId: cached.mediaId };
     }
 
-    let imageBuffer: ArrayBuffer;
+    let imageBytes: Uint8Array;
     let contentType = "image/jpeg";
 
     // 处理不同类型的图片来源
@@ -103,16 +286,23 @@ export async function uploadTempMedia(
       }
       contentType = matches[1];
       const base64Data = matches[2];
-      imageBuffer = Buffer.from(base64Data, "base64").buffer;
-    } else if (imageSource.startsWith("/") || imageSource.match(/^[A-Za-z]:\\/)) {
-      // 本地文件路径
+      const buf = Buffer.from(base64Data, "base64");
+      if (buf.byteLength > MAX_DATA_URL_BYTES) {
+        return { success: false, error: `data URL 图片过大 (limit=${MAX_DATA_URL_BYTES} bytes)` };
+      }
+      imageBytes = new Uint8Array(buf);
+    } else if (isProbablyFilePath(imageSource)) {
+      // 本地文件路径（强安全：只允许受控目录）
       const fs = await import("node:fs/promises");
-      const path = await import("node:path");
       try {
-        const fileBuffer = await fs.readFile(imageSource);
-        imageBuffer = fileBuffer.buffer;
+        const safePath = await resolveSafeLocalImagePath(imageSource);
+        const fileBuffer = await fs.readFile(safePath);
+        if (fileBuffer.byteLength > MAX_IMAGE_BYTES) {
+          return { success: false, error: `本地图片过大 (limit=${MAX_IMAGE_BYTES} bytes)` };
+        }
+        imageBytes = new Uint8Array(fileBuffer);
         // 根据扩展名推断 content type
-        const ext = path.extname(imageSource).toLowerCase();
+        const ext = path.extname(safePath).toLowerCase();
         if (ext === ".png") contentType = "image/png";
         else if (ext === ".gif") contentType = "image/gif";
         else if (ext === ".webp") contentType = "image/webp";
@@ -122,18 +312,26 @@ export async function uploadTempMedia(
       }
     } else {
       // HTTP/HTTPS URL
-      const imageResponse = await fetch(imageSource);
-      if (!imageResponse.ok) {
-        return { success: false, error: `下载图片失败: ${imageResponse.status}` };
+      let url: URL;
+      try {
+        url = await validateExternalUrl(imageSource);
+      } catch (e) {
+        return { success: false, error: `禁止的图片 URL: ${String(e)}` };
       }
-      imageBuffer = await imageResponse.arrayBuffer();
+
+      const imageResponse = await safeFetch(url.toString(), undefined, {
+        timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+        maxBytes: MAX_IMAGE_BYTES,
+        redirect: "follow",
+      });
+      if (!imageResponse.ok) return { success: false, error: `下载图片失败: ${imageResponse.status}` };
+
       contentType = imageResponse.headers.get("content-type") || "image/jpeg";
+      imageBytes = await readResponseBytesWithLimit(imageResponse, MAX_IMAGE_BYTES);
     }
 
     // 确定文件扩展名
-    let ext = "jpg";
-    if (contentType.includes("png")) ext = "png";
-    else if (contentType.includes("gif")) ext = "gif";
+    const ext = inferImageExtFromContentType(contentType);
 
     // 上传到微信
     const accessToken = await getAccessToken(account);
@@ -148,7 +346,7 @@ export async function uploadTempMedia(
     // 添加文件字段
     const header = `--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${filename}"\r\nContent-Type: ${contentType}\r\n\r\n`;
     bodyParts.push(new TextEncoder().encode(header));
-    bodyParts.push(new Uint8Array(imageBuffer));
+    bodyParts.push(imageBytes);
     bodyParts.push(new TextEncoder().encode(`\r\n--${boundary}--\r\n`));
 
     // 合并所有部分
@@ -160,13 +358,17 @@ export async function uploadTempMedia(
       offset += part.length;
     }
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+    const response = await safeFetch(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body,
       },
-      body,
-    });
+      { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+    );
 
     const data = await response.json() as { media_id?: string; errcode?: number; errmsg?: string };
 
@@ -200,7 +402,9 @@ export async function sendImageMessage(
     const accessToken = await getAccessToken(account);
     const url = `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${accessToken}`;
 
-    const response = await fetch(url, {
+    const response = await safeFetch(
+      url,
+      {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -208,7 +412,9 @@ export async function sendImageMessage(
         msgtype: "image",
         image: { media_id: mediaId },
       }),
-    });
+      },
+      { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+    );
 
     const data = await response.json() as { errcode?: number; errmsg?: string };
 
@@ -259,7 +465,9 @@ export async function sendNewsMessage(
     const accessToken = await getAccessToken(account);
     const url = `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${accessToken}`;
 
-    const response = await fetch(url, {
+    const response = await safeFetch(
+      url,
+      {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -267,7 +475,9 @@ export async function sendNewsMessage(
         msgtype: "news",
         news: { articles },
       }),
-    });
+      },
+      { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+    );
 
     const data = await response.json() as { errcode?: number; errmsg?: string };
 
@@ -292,14 +502,18 @@ export async function sendTypingStatus(
     const accessToken = await getAccessToken(account);
     const url = `https://api.weixin.qq.com/cgi-bin/message/custom/typing?access_token=${accessToken}`;
 
-    const response = await fetch(url, {
+    const response = await safeFetch(
+      url,
+      {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         touser: openId,
         command: "Typing",
       }),
-    });
+      },
+      { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+    );
 
     const data = await response.json() as { errcode?: number };
     return data.errcode === 0;
@@ -315,14 +529,16 @@ export async function downloadImageAsDataUrl(
   imageUrl: string
 ): Promise<{ success: boolean; dataUrl?: string; error?: string }> {
   try {
-    const response = await fetch(imageUrl);
-    if (!response.ok) {
-      return { success: false, error: `下载图片失败: ${response.status}` };
-    }
+    const url = await validateExternalUrl(imageUrl);
+    const response = await safeFetch(url.toString(), undefined, {
+      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+      redirect: "follow",
+    });
+    if (!response.ok) return { success: false, error: `下载图片失败: ${response.status}` };
 
-    const buffer = await response.arrayBuffer();
+    const bytes = await readResponseBytesWithLimit(response, MAX_IMAGE_BYTES);
     const contentType = response.headers.get("content-type") || "image/jpeg";
-    const base64 = Buffer.from(buffer).toString("base64");
+    const base64 = Buffer.from(bytes).toString("base64");
     const dataUrl = `data:${contentType};base64,${base64}`;
 
     return { success: true, dataUrl };
@@ -341,42 +557,46 @@ export async function downloadImageToFile(
 ): Promise<{ success: boolean; filePath?: string; error?: string }> {
   try {
     const fs = await import("node:fs/promises");
-    const path = await import("node:path");
-    const os = await import("node:os");
 
     // 默认下载目录
-    const dir = downloadDir || path.join(os.homedir(), ".openclaw", "data", "wemp", "images");
+    const dir = downloadDir || getDefaultWempImageDir();
 
     // 确保目录存在
     await fs.mkdir(dir, { recursive: true });
 
     // 下载图片
-    const response = await fetch(imageUrl);
-    if (!response.ok) {
-      return { success: false, error: `下载图片失败: ${response.status}` };
-    }
+    const url = await validateExternalUrl(imageUrl);
+    const response = await safeFetch(url.toString(), undefined, {
+      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+      redirect: "follow",
+    });
+    if (!response.ok) return { success: false, error: `下载图片失败: ${response.status}` };
 
-    const buffer = await response.arrayBuffer();
     const contentType = response.headers.get("content-type") || "image/jpeg";
+    const bytes = await readResponseBytesWithLimit(response, MAX_IMAGE_BYTES);
 
     // 确定文件扩展名
-    let ext = "jpg";
-    if (contentType.includes("png")) ext = "png";
-    else if (contentType.includes("gif")) ext = "gif";
-    else if (contentType.includes("webp")) ext = "webp";
+    const ext = inferImageExtFromContentType(contentType);
 
     // 生成唯一文件名
-    const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    const filename = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}.${ext}`;
     const filePath = path.join(dir, filename);
 
     // 写入文件
-    await fs.writeFile(filePath, Buffer.from(buffer));
+    await fs.writeFile(filePath, Buffer.from(bytes));
 
     return { success: true, filePath };
   } catch (error) {
     return { success: false, error: String(error) };
   }
 }
+
+export const __internal = {
+  timingSafeEqualString,
+  validateExternalUrl,
+  readResponseBytesWithLimit,
+  isPrivateIp,
+};
 
 // ============ 自定义菜单 API ============
 
@@ -477,66 +697,78 @@ export async function deleteMenu(
 
 /**
  * 创建 OpenClaw 默认菜单
- * 包含常用的内置命令
+ * 包含常用的内置命令，支持自定义第三个菜单
+ *
+ * @param customMenu 可选的自定义菜单配置（用于第三个菜单位置）
  */
-export function createOpenClawDefaultMenu(): Menu {
-  return {
-    button: [
-      {
-        name: "对话",
-        sub_button: [
-          {
-            type: "click",
-            name: "新对话",
-            key: "CMD_NEW",
-          },
-          {
-            type: "click",
-            name: "清除上下文",
-            key: "CMD_CLEAR",
-          },
-          {
-            type: "click",
-            name: "撤销上条",
-            key: "CMD_UNDO",
-          },
-        ],
-      },
-      {
-        name: "功能",
-        sub_button: [
-          {
-            type: "click",
-            name: "帮助",
-            key: "CMD_HELP",
-          },
-          {
-            type: "click",
-            name: "查看状态",
-            key: "CMD_STATUS",
-          },
-          {
-            type: "click",
-            name: "配对账号",
-            key: "CMD_PAIR",
-          },
-        ],
-      },
-      {
-        name: "更多",
-        sub_button: [
-          {
-            type: "click",
-            name: "模型信息",
-            key: "CMD_MODEL",
-          },
-          {
-            type: "click",
-            name: "使用统计",
-            key: "CMD_USAGE",
-          },
-        ],
-      },
-    ],
-  };
+export function createOpenClawDefaultMenu(customMenu?: MenuButton): Menu {
+  const buttons: MenuButton[] = [
+    // 菜单一：内容（公众号核心功能）
+    {
+      name: "内容",
+      sub_button: [
+        { type: "click", name: "历史文章", key: "CMD_ARTICLES" },
+        { type: "click", name: "访问官网", key: "CMD_WEBSITE" },
+      ],
+    },
+    // 菜单二：AI 助手（核心对话功能）
+    {
+      name: "AI助手",
+      sub_button: [
+        { type: "click", name: "新对话", key: "CMD_NEW" },
+        { type: "click", name: "清除上下文", key: "CMD_CLEAR" },
+        { type: "click", name: "帮助", key: "CMD_HELP" },
+        { type: "click", name: "配对账号", key: "CMD_PAIR" },
+        { type: "click", name: "查看状态", key: "CMD_STATUS" },
+      ],
+    },
+  ];
+
+  // 菜单三：更多（用户自定义或默认）
+  if (customMenu) {
+    buttons.push(customMenu);
+  } else {
+    // 默认的第三个菜单
+    buttons.push({
+      name: "更多",
+      sub_button: [
+        { type: "click", name: "撤销上条", key: "CMD_UNDO" },
+        { type: "click", name: "模型信息", key: "CMD_MODEL" },
+        { type: "click", name: "使用统计", key: "CMD_USAGE" },
+      ],
+    });
+  }
+
+  return { button: buttons };
+}
+
+/**
+ * 从配置创建完整菜单
+ * 支持从配置文件读取自定义菜单
+ *
+ * 配置示例 (openclaw.json):
+ * {
+ *   "channels": {
+ *     "wemp": {
+ *       "articlesUrl": "https://mp.weixin.qq.com/...",  // 历史文章链接
+ *       "websiteUrl": "https://example.com",           // 官网链接
+ *       "contactInfo": "联系方式...",                   // 联系信息
+ *       "menu": {                                       // 完全自定义菜单（可选）
+ *         "button": [...]
+ *       }
+ *     }
+ *   }
+ * }
+ */
+export function createMenuFromConfig(cfg: any): Menu {
+  const wempCfg = cfg?.channels?.wemp;
+
+  // 如果配置了完整菜单，直接使用
+  if (wempCfg?.menu?.button) {
+    return wempCfg.menu as Menu;
+  }
+
+  // 否则使用默认菜单 + 可选的自定义第三菜单
+  const customMenuConfig = wempCfg?.customMenu as MenuButton | undefined;
+  return createOpenClawDefaultMenu(customMenuConfig);
 }
