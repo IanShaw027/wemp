@@ -1,0 +1,30 @@
+{
+  "name": "wechat-mp",
+  "version": "1.0.0",
+  "description": "微信公众号 channel plugin for Clawdbot",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "clawdbot": {
+    "extensions": ["./index.ts"]
+  },
+  "moltbot": {
+    "extensions": ["./index.ts"]
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "build": "tsc || true",
+    "dev": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "clawdbot": "*",
+    "moltbot": "*",
+    "openclaw": "*"
+  }
+}
