@@ -14,6 +14,8 @@
 - ✅ 长消息自动分段发送
 - ✅ 关注/取关事件处理
 - ✅ 交互式配置向导
+- ✅ **双 Agent 模式**：客服模式 + 个人助理模式
+- ✅ **跨渠道配对**：通过其他渠道（Telegram、QQ 等）配对后解锁完整功能
 
 ## 安装
 
@@ -180,6 +182,55 @@ openclaw logs --limit 100
 3. **IP 白名单**: 需要在公众号后台配置服务器 IP 白名单
 4. **HTTPS 必须**: 微信公众号服务器配置 URL 必须是 HTTPS
 
+## 配对功能（双 Agent 模式）
+
+wemp 支持两种工作模式：
+
+| 模式 | Agent | 说明 |
+|------|-------|------|
+| 客服模式 | `wemp-cs` | 未配对用户，功能受限 |
+| 个人助理模式 | `main` | 已配对用户，完整功能 |
+
+### 用户命令
+
+在微信公众号中发送以下命令：
+
+- **配对** / **绑定**：获取 6 位配对码
+- **解除配对** / **取消绑定**：取消配对
+- **状态** / **/status**：查看当前模式
+
+### 跨渠道配对流程
+
+1. 用户在微信公众号发送「配对」，获取配对码（如 `123456`）
+2. 用户在其他已授权渠道（如 Telegram、QQ）发送：`/pair wemp 123456`
+3. 配对成功后，用户在微信公众号将使用完整的个人助理功能
+
+### 配对 API
+
+其他渠道可以通过 API 完成配对：
+
+```bash
+POST /wemp/api/pair
+Content-Type: application/json
+
+{
+  "code": "123456",
+  "userId": "user123",
+  "userName": "张三",
+  "channel": "telegram",
+  "token": "your-api-token"
+}
+```
+
+### 环境变量配置
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WEMP_AGENT_PAIRED` | `main` | 已配对用户使用的 Agent ID |
+| `WEMP_AGENT_UNPAIRED` | `wemp-cs` | 未配对用户使用的 Agent ID |
+| `WEMP_PAIRING_API_TOKEN` | `wemp-pairing-token` | 配对 API 验证 Token |
+| `WEMP_DATA_DIR` | `~/.openclaw/data/wemp` | 配对数据存储目录 |
+
 ## 常见问题
 
 ### Q: 配置后无法收到消息？
@@ -226,10 +277,12 @@ wemp/
 │   ├── crypto.ts         # 消息加解密
 │   ├── onboarding.ts     # CLI 配置向导
 │   ├── outbound.ts       # 出站消息处理
+│   ├── pairing.ts        # 配对功能
 │   ├── runtime.ts        # 运行时状态
 │   ├── types.ts          # 类型定义
 │   └── webhook-handler.ts # Webhook 处理
-├── openclaw.plugin.json  # 插件元数据
+├── openclaw.plugin.json  # 插件元数据（OpenClaw）
+├── clawdbot.plugin.json  # 插件元数据（Clawdbot 兼容）
 ├── package.json
 └── tsconfig.json
 ```
