@@ -21,6 +21,7 @@ import {
   PERMANENT_MEDIA_UPLOAD_TIMEOUT_MS,
   MAX_MEDIA_DOWNLOAD_BYTES,
 } from "./constants.js";
+import { logError, logInfo } from "./log.js";
 
 // Access Token 缓存
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
@@ -223,7 +224,7 @@ export async function getAccessToken(account: ResolvedWechatMpAccount): Promise<
   const expiresAt = Date.now() + (data.expires_in ?? DEFAULT_ACCESS_TOKEN_EXPIRY_SECONDS) * 1000;
 
   tokenCache.set(cacheKey, { token, expiresAt });
-  console.log(`[wemp:${account.accountId}] Access Token 已刷新`);
+  logInfo(`[wemp:${account.accountId}] Access Token 已刷新`);
 
   return token;
 }
@@ -720,15 +721,15 @@ export async function getMedia(
   // 先尝试临时素材 API
   const tempResult = await getTempMedia(account, mediaId);
   if (tempResult.success) {
-    console.log(`[wemp] 通过临时素材 API 下载成功: ${mediaId.substring(0, 20)}...`);
+    logInfo(`[wemp] 通过临时素材 API 下载成功: ${mediaId.substring(0, 20)}...`);
     return tempResult;
   }
 
   // 临时素材失败，尝试永久素材 API
-  console.log(`[wemp] 临时素材 API 失败 (${tempResult.error})，尝试永久素材 API...`);
+  logInfo(`[wemp] 临时素材 API 失败 (${tempResult.error})，尝试永久素材 API...`);
   const permResult = await getPermanentMedia(account, mediaId);
   if (permResult.success) {
-    console.log(`[wemp] 通过永久素材 API 下载成功: ${mediaId.substring(0, 20)}...`);
+    logInfo(`[wemp] 通过永久素材 API 下载成功: ${mediaId.substring(0, 20)}...`);
     return permResult;
   }
 
@@ -1525,7 +1526,7 @@ export async function syncMenuWithAiAssistant(
     }
 
     const currentButtons = currentMenuResult.buttons || [];
-    console.log(`[wemp:${account.accountId}] 当前菜单: ${currentButtons.map(b => b.name).join(", ") || "无"}`);
+    logInfo(`[wemp:${account.accountId}] 当前菜单: ${currentButtons.map(b => b.name).join(", ") || "无"}`);
 
     // 获取 API 菜单（检查是否已有 AI 助手）
     const apiMenuResult = await getMenu(account);
@@ -1564,11 +1565,11 @@ export async function syncMenuWithAiAssistant(
     const truncationNote = hasTruncation
       ? `（注意：原一级菜单 ${businessButtons.length} 个，已保留前 2 个并追加 AI助手）`
       : "";
-    console.log(`[wemp:${account.accountId}] 菜单${action === "created" ? "创建" : "更新"}成功: ${menuNames}`);
+    logInfo(`[wemp:${account.accountId}] 菜单${action === "created" ? "创建" : "更新"}成功: ${menuNames}`);
 
     return { success: true, action, message: `菜单${action === "created" ? "创建" : "更新"}成功: ${menuNames}${truncationNote}` };
   } catch (error) {
-    console.error(`[wemp:${account.accountId}] 同步菜单失败:`, error);
+    logError(`[wemp:${account.accountId}] 同步菜单失败:`, error);
     return { success: false, action: "error", message: `同步菜单失败: ${String(error)}` };
   }
 }

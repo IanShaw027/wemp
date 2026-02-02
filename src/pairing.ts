@@ -1,199 +1,175 @@
 /**
- * 微信公众号配对功能
- * 支持通过其他渠道配对，配对后可使用完整的个人助理功能
+ * Pairing (OpenClaw-native)
+ *
+ * - Pairing requests + approvals are handled by OpenClaw's pairing-store (via runtime.channel.pairing.*).
+ * - wemp uses OpenClaw allowFrom store as the source of truth for "paired" access.
+ * - Optional local "opt-out" flag allows a user to disable paired-mode routing without requiring
+ *   the owner to remove allowFrom store entries.
  */
 import * as path from "node:path";
-import * as crypto from "node:crypto";
-import { PAIRING_CODE_EXPIRY_MS } from "./constants.js";
-import { getDataDir, readJsonFile, writeJsonFile } from "./storage.js";
+import { getDataDir, readJsonFile, writeJsonFile, withFileLock } from "./storage.js";
 
-// 数据存储路径
 const DATA_DIR = getDataDir();
-const PAIRING_FILE = path.join(DATA_DIR, "paired-users.json");
-const PENDING_FILE = path.join(DATA_DIR, "pending-codes.json");
+const OPT_OUT_FILE = path.join(DATA_DIR, "pairing-optout.json");
+const OPT_OUT_LOCK_BASE = path.join(DATA_DIR, "pairing-optout");
 
-// 配对用户信息
-export interface PairedUser {
-  pairedAt: number;
-  pairedBy: string;
-  pairedByName?: string;
-  pairedByChannel?: string;
+const DEFAULT_ACCOUNT_ID = "default";
+const CHANNEL_ID = "wemp";
+
+type OptOutStore = { version: 1; optOut: Record<string, true> };
+const OPT_OUT_DEFAULT: OptOutStore = { version: 1, optOut: {} };
+
+function buildSubjectId(accountId: string, openId: string): string {
+  const a = String(accountId ?? "").trim() || DEFAULT_ACCOUNT_ID;
+  const o = String(openId ?? "").trim();
+  return `${a}:${o}`;
 }
 
-// 待验证的配对码
-interface PendingCode {
-  openId: string;
-  accountId: string;
-  createdAt: number;
-}
-
-/**
- * 加载配对用户列表
- */
-function loadPairedUsers(): Record<string, PairedUser> {
-  return readJsonFile(PAIRING_FILE, {});
-}
-
-/**
- * 保存配对用户列表
- */
-function savePairedUsers(users: Record<string, PairedUser>): void {
-  writeJsonFile(PAIRING_FILE, users);
-}
-
-/**
- * 加载待验证的配对码
- */
-function loadPendingCodes(): Record<string, PendingCode> {
-  const data = readJsonFile<Record<string, PendingCode>>(PENDING_FILE, {});
-  // 清理过期的配对码
-  const now = Date.now();
-  const valid: Record<string, PendingCode> = {};
-  for (const [code, info] of Object.entries(data)) {
-    if (now - info.createdAt < PAIRING_CODE_EXPIRY_MS) {
-      valid[code] = info;
-    }
+export function parseSubjectId(raw: string): { accountId: string; openId: string } {
+  const value = String(raw ?? "").trim();
+  const idx = value.indexOf(":");
+  if (idx <= 0) {
+    return { accountId: DEFAULT_ACCOUNT_ID, openId: value };
   }
-  return valid;
+  const accountId = value.slice(0, idx).trim() || DEFAULT_ACCOUNT_ID;
+  const openId = value.slice(idx + 1).trim();
+  return { accountId, openId };
 }
 
-/**
- * 保存待验证的配对码
- */
-function savePendingCodes(codes: Record<string, PendingCode>): void {
-  writeJsonFile(PENDING_FILE, codes);
-}
-
-/**
- * 生成用户唯一标识（accountId:openId）
- */
-function getUserKey(accountId: string, openId: string): string {
-  return `${accountId}:${openId}`;
-}
-
-/**
- * 检查用户是否已配对
- */
-export function isPaired(accountId: string, openId: string): boolean {
-  const users = loadPairedUsers();
-  return !!users[getUserKey(accountId, openId)];
-}
-
-/**
- * 获取已配对用户信息
- */
-export function getPairedUser(accountId: string, openId: string): PairedUser | null {
-  const users = loadPairedUsers();
-  return users[getUserKey(accountId, openId)] || null;
-}
-
-/**
- * 生成配对码
- */
-export function generatePairingCode(accountId: string, openId: string): string {
-  const codes = loadPendingCodes();
-  const userKey = getUserKey(accountId, openId);
-
-  // 检查是否已有未过期的配对码
-  for (const [code, info] of Object.entries(codes)) {
-    if (info.accountId === accountId && info.openId === openId) {
-      return code;
-    }
+function readOptOutStore(): OptOutStore {
+  const parsed = readJsonFile<OptOutStore>(OPT_OUT_FILE, OPT_OUT_DEFAULT);
+  if (!parsed || typeof parsed !== "object") return OPT_OUT_DEFAULT;
+  const version = (parsed as any).version;
+  const optOut = (parsed as any).optOut;
+  if (version !== 1 || !optOut || typeof optOut !== "object" || Array.isArray(optOut)) {
+    return OPT_OUT_DEFAULT;
   }
-
-  // 生成新的 6 位配对码
-  const code = crypto.randomInt(100000, 999999).toString();
-  codes[code] = {
-    openId,
-    accountId,
-    createdAt: Date.now(),
+  return {
+    version: 1,
+    optOut: optOut as Record<string, true>,
   };
-  savePendingCodes(codes);
-
-  return code;
 }
 
-/**
- * 验证配对码（从其他渠道调用）
- * 返回 { accountId, openId } 如果验证成功，否则返回 null
- */
-export function verifyPairingCode(
-  code: string,
-  userId: string,
-  userName?: string,
-  channel?: string
-): { accountId: string; openId: string } | null {
-  const codes = loadPendingCodes();
-  const info = codes[code];
-
-  if (!info) {
-    return null;
-  }
-
-  // 检查是否过期
-  if (Date.now() - info.createdAt > PAIRING_CODE_EXPIRY_MS) {
-    delete codes[code];
-    savePendingCodes(codes);
-    return null;
-  }
-
-  // 配对成功
-  const users = loadPairedUsers();
-  const userKey = getUserKey(info.accountId, info.openId);
-  users[userKey] = {
-    pairedAt: Date.now(),
-    pairedBy: userId,
-    pairedByName: userName,
-    pairedByChannel: channel,
-  };
-  savePairedUsers(users);
-
-  // 删除已使用的配对码
-  delete codes[code];
-  savePendingCodes(codes);
-
-  return { accountId: info.accountId, openId: info.openId };
+function writeOptOutStore(next: OptOutStore): void {
+  writeJsonFile(OPT_OUT_FILE, next);
 }
 
-/**
- * 取消配对
- */
-export function unpair(accountId: string, openId: string): boolean {
-  const users = loadPairedUsers();
-  const userKey = getUserKey(accountId, openId);
-  if (users[userKey]) {
-    delete users[userKey];
-    savePairedUsers(users);
-    return true;
-  }
-  return false;
+function isOptedOutSync(accountId: string, openId: string): boolean {
+  const key = buildSubjectId(accountId, openId);
+  const store = readOptOutStore();
+  return store.optOut[key] === true;
 }
 
-/**
- * 列出所有已配对用户
- */
-export function listPairedUsers(): Record<string, PairedUser> {
-  return loadPairedUsers();
+export function setOptOut(accountId: string, openId: string, optedOut: boolean): void {
+  withFileLock(OPT_OUT_LOCK_BASE, () => {
+    const store = readOptOutStore();
+    const key = buildSubjectId(accountId, openId);
+    const next: OptOutStore = { version: 1, optOut: { ...store.optOut } };
+    if (optedOut) {
+      next.optOut[key] = true;
+    } else {
+      delete next.optOut[key];
+    }
+    writeOptOutStore(next);
+  });
 }
 
-// 配对 API Token（强安全：默认禁用，必须显式配置）
+// Pairing API Token（强安全：默认禁用，必须显式配置）
 // - 可通过环境变量 WEMP_PAIRING_API_TOKEN 设置（作为全局默认）
 // - 也可通过配置文件按 accountId 覆盖（见 setPairingApiToken）
 const pairingApiTokenByAccountId = new Map<string, string>();
 let defaultPairingApiToken: string | undefined = process.env.WEMP_PAIRING_API_TOKEN?.trim() || undefined;
 
-/**
- * 设置配对 API Token
- */
 export function setPairingApiToken(accountId: string, token: string): void {
   const t = String(token || "").trim();
   if (!t) return;
-  pairingApiTokenByAccountId.set(accountId, t);
+  pairingApiTokenByAccountId.set(String(accountId || DEFAULT_ACCOUNT_ID), t);
 }
 
-/**
- * 获取配对 API Token（用于验证其他渠道的配对请求）
- */
 export function getPairingApiToken(accountId: string): string | undefined {
-  return pairingApiTokenByAccountId.get(accountId) ?? defaultPairingApiToken;
+  return pairingApiTokenByAccountId.get(String(accountId || DEFAULT_ACCOUNT_ID)) ?? defaultPairingApiToken;
+}
+
+// ---- OpenClaw allowFrom store cache (process-local) ----
+type AllowFromCache = { refreshedAt: number; entries: Set<string> };
+let allowFromCache: AllowFromCache | null = null;
+const ALLOW_FROM_CACHE_TTL_MS = 10_000;
+
+async function readAllowFromStore(runtime: any): Promise<Set<string>> {
+  const now = Date.now();
+  if (allowFromCache && now - allowFromCache.refreshedAt < ALLOW_FROM_CACHE_TTL_MS) {
+    return allowFromCache.entries;
+  }
+
+  const readFn = runtime?.channel?.pairing?.readAllowFromStore;
+  if (typeof readFn !== "function") {
+    // If runtime doesn't support pairing store, treat as not paired.
+    allowFromCache = { refreshedAt: now, entries: new Set<string>() };
+    return allowFromCache.entries;
+  }
+
+  try {
+    const list = await readFn(CHANNEL_ID);
+    const entries = new Set<string>(
+      (Array.isArray(list) ? list : []).map((v) => String(v ?? "").trim()).filter(Boolean),
+    );
+    allowFromCache = { refreshedAt: now, entries };
+    return entries;
+  } catch {
+    allowFromCache = { refreshedAt: now, entries: new Set<string>() };
+    return allowFromCache.entries;
+  }
+}
+
+export function recordApprovedSubjectId(subjectId: string): void {
+  const now = Date.now();
+  const trimmed = String(subjectId ?? "").trim();
+  if (!trimmed) return;
+  if (!allowFromCache) {
+    allowFromCache = { refreshedAt: now, entries: new Set([trimmed]) };
+    return;
+  }
+  allowFromCache.entries.add(trimmed);
+  allowFromCache.refreshedAt = now;
+}
+
+export async function isPaired(params: {
+  runtime: any;
+  accountId: string;
+  openId: string;
+}): Promise<boolean> {
+  const openId = String(params.openId ?? "").trim();
+  if (!openId) return false;
+
+  if (isOptedOutSync(params.accountId, openId)) {
+    return false;
+  }
+
+  const entries = await readAllowFromStore(params.runtime);
+  const subjectId = buildSubjectId(params.accountId, openId);
+
+  // Exact match only (account-scoped).
+  return entries.has(subjectId);
+}
+
+export async function requestPairing(params: {
+  runtime: any;
+  accountId: string;
+  openId: string;
+  meta?: Record<string, string | number | boolean | null | undefined>;
+}): Promise<{ code: string; created: boolean }> {
+  const upsert = params.runtime?.channel?.pairing?.upsertPairingRequest;
+  if (typeof upsert !== "function") {
+    throw new Error("OpenClaw pairing runtime not available");
+  }
+  const id = buildSubjectId(params.accountId, params.openId);
+  const meta = params.meta ?? {};
+  const result = await upsert({
+    channel: CHANNEL_ID,
+    id,
+    meta,
+  });
+  const code = String(result?.code ?? "").trim();
+  const created = Boolean(result?.created);
+  return { code, created };
 }

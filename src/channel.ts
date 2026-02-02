@@ -8,7 +8,8 @@ import { sendText } from "./outbound.js";
 import { registerWechatMpWebhookTarget, initPairingConfig, setStoredConfig } from "./webhook-handler.js";
 import { wechatMpOnboardingAdapter } from "./onboarding.js";
 import { getAccessToken, sendCustomMessage } from "./api.js";
-import { verifyPairingCode } from "./pairing.js";
+import { parseSubjectId, recordApprovedSubjectId, setOptOut } from "./pairing.js";
+import { logWarn } from "./log.js";
 import { WECHAT_MESSAGE_TEXT_LIMIT } from "./constants.js";
 
 const DEFAULT_ACCOUNT_ID = "default";
@@ -16,38 +17,49 @@ const DEFAULT_ACCOUNT_ID = "default";
 // 配对成功消息
 const PAIRING_APPROVED_MESSAGE = "🎉 配对成功！你现在可以使用完整的 AI 助手功能了。";
 
-// 使用 any 扩展类型以支持 pairing 属性
+// openclaw/plugin-sdk's ChannelPlugin type doesn't currently include the optional `pairing` field,
+// but OpenClaw supports it in runtime. Keep it as an intersection to avoid widening the sdk .d.ts.
 export const wechatMpPlugin: ChannelPlugin<ResolvedWechatMpAccount> & { pairing?: any } = {
   id: "wemp",
   meta: {
     id: "wemp",
     label: "微信公众号",
-    selectionLabel: "微信公众号",
-    docsPath: "/docs/channels/wemp",
+    selectionLabel: "微信公众号 (plugin)",
+    docsPath: "/channels/wemp",
     blurb: "通过服务号客服消息接口连接微信",
-    order: 60,
+    order: 86,
   },
   // 配对支持 - 让 OpenClaw CLI 能够识别 wemp 渠道
   pairing: {
     idLabel: "wempOpenId",
     normalizeAllowEntry: (entry: string) => entry.replace(/^wemp:/i, ""),
     notifyApproval: async ({ cfg, id }: { cfg: any; id: string }) => {
-      // id 是配对码，需要验证并获取 openId
-      const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+      // OpenClaw pairing-store calls notify with the approved sender id (not the code).
+      // For wemp, we store sender id as `${accountId}:${openId}`.
+      const parsed = parseSubjectId(id);
+      const account =
+        resolveWechatMpAccount(cfg, parsed.accountId) ?? resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
       if (!account?.appId) {
         throw new Error("wemp not configured");
       }
-
-      // 尝试验证配对码（如果 id 是配对码）
-      // 注意：这里的 id 可能是 openId 或配对码
-      if (/^\d{6}$/.test(id)) {
-        // 这是配对码，配对逻辑在 /wemp/api/pair 端点处理
-        console.log(`[wemp] 收到配对请求，配对码: ${id}`);
-        return;
+      if (!parsed.openId) {
+        throw new Error("wemp notifyApproval missing openId");
       }
 
-      // 如果是 openId，直接发送通知
-      await sendCustomMessage(account, id, PAIRING_APPROVED_MESSAGE);
+      await sendCustomMessage(account, parsed.openId, PAIRING_APPROVED_MESSAGE);
+
+      // Ensure subsequent inbound checks observe the approval quickly (process-local cache),
+      // and clear local opt-out so the user enters paired-mode immediately.
+      try {
+        recordApprovedSubjectId(id);
+      } catch (err) {
+        logWarn(`[wemp:${parsed.accountId}] recordApprovedSubjectId failed: ${String(err)}`);
+      }
+      try {
+        setOptOut(parsed.accountId, parsed.openId, false);
+      } catch (err) {
+        logWarn(`[wemp:${parsed.accountId}] setOptOut(false) failed: ${String(err)}`);
+      }
     },
   },
   capabilities: {

@@ -8,6 +8,7 @@ import { isOk } from "./result.js";
 import { processImagesInText } from "./image-processor.js";
 import { WECHAT_MESSAGE_TEXT_LIMIT, MAX_IMAGES_PER_MESSAGE } from "./constants.js";
 import { recordUsageLimitOutbound } from "./usage-limit-tracker.js";
+import { logError, logInfo, logWarn } from "./log.js";
 
 function replaceAgentIdInSessionKey(sessionKey: string, agentId: string): string {
   const trimmedKey = (sessionKey ?? "").trim();
@@ -76,9 +77,10 @@ export async function dispatchWempMessage(params: {
   const recordSessionMetaFromInbound = runtime.channel?.session?.recordSessionMetaFromInbound;
   const resolveStorePath = runtime.channel?.session?.resolveStorePath;
   const updateLastRoute = runtime.channel?.session?.updateLastRoute;
+  const recordInboundSession = runtime.channel?.session?.recordInboundSession;
 
   if (!dispatchReplyWithBufferedBlockDispatcher) {
-    console.error(`[wemp:${account.accountId}] dispatchReplyWithBufferedBlockDispatcher not available in runtime`);
+    logError(runtime, `[wemp:${account.accountId}] dispatchReplyWithBufferedBlockDispatcher not available in runtime`);
     return undefined;
   }
 
@@ -90,7 +92,7 @@ export async function dispatchWempMessage(params: {
       direction: "inbound",
     });
   } catch (err) {
-    console.warn(`[wemp:${account.accountId}] recordChannelActivity failed:`, err);
+    logWarn(runtime, `[wemp:${account.accountId}] recordChannelActivity failed:`, err);
   }
 
   // 2. 解析路由 - 但保留我们基于配对状态的 agentId
@@ -125,7 +127,7 @@ export async function dispatchWempMessage(params: {
       sessionKey = replaceAgentIdInSessionKey(looksPerPeer ? routeKey : fallback.sessionKey, agentId);
       mainSessionKey = replaceAgentIdInSessionKey(routeMainKey || fallback.mainSessionKey, agentId);
     } catch (err) {
-      console.warn(`[wemp:${account.accountId}] resolveAgentRoute failed:`, err);
+      logWarn(runtime, `[wemp:${account.accountId}] resolveAgentRoute failed:`, err);
     }
   }
 
@@ -139,7 +141,8 @@ export async function dispatchWempMessage(params: {
     mainSessionKey = fallback.mainSessionKey;
   }
 
-  console.log(
+  logInfo(
+    runtime,
     `[wemp:${account.accountId}] 路由: agentId=${agentId}, sessionKey=${sessionKey}, mainSessionKey=${mainSessionKey}`,
   );
 
@@ -167,11 +170,17 @@ export async function dispatchWempMessage(params: {
         envelope: envelopeOptions,
       }) ?? messageText;
     } catch (err) {
-      console.warn(`[wemp:${account.accountId}] formatInboundEnvelope failed:`, err);
+      logWarn(runtime, `[wemp:${account.accountId}] formatInboundEnvelope failed:`, err);
     }
   }
 
   // 4. 构建 inbound context
+  const shouldComputeAuth =
+    typeof runtime.channel?.commands?.shouldComputeCommandAuthorized === "function"
+      ? runtime.channel.commands.shouldComputeCommandAuthorized(text, cfg)
+      : typeof runtime.channel?.text?.hasControlCommand === "function"
+        ? runtime.channel.text.hasControlCommand(text, cfg)
+        : /^\s*\//u.test(text);
   const commandAuthorized = params.forceCommandAuthorized === true || params.commandAuthorized === true;
   let ctx: any = {
     Body: body,
@@ -190,10 +199,12 @@ export async function dispatchWempMessage(params: {
     Timestamp: timestamp,
     OriginatingChannel: "wemp",
     OriginatingTo: fromAddress,
-    CommandAuthorized: commandAuthorized,
     // 指定 agent ID - 这是关键！
     AgentId: agentId,
   };
+  if (shouldComputeAuth) {
+    ctx.CommandAuthorized = commandAuthorized;
+  }
 
   // 添加图片附件（使用本地文件路径）
   if (imageFilePath) {
@@ -213,36 +224,57 @@ export async function dispatchWempMessage(params: {
     ctx = finalizeInboundContext(ctx);
   }
 
-  // 5. 记录会话元数据
-  if (recordSessionMetaFromInbound && resolveStorePath) {
-    try {
-      const storePath = resolveStorePath(cfg.session?.store, { agentId });
-      await recordSessionMetaFromInbound({
-        storePath,
-        sessionKey: ctx.SessionKey ?? sessionKey,
-        ctx,
-      });
-    } catch (err) {
-      console.warn(`[wemp:${account.accountId}] recordSessionMetaFromInbound failed:`, err);
-    }
-  }
-
-  // 6. 更新最后路由
-  if (updateLastRoute && resolveStorePath) {
-    try {
-      const storePath = resolveStorePath(cfg.session?.store, { agentId });
-      await updateLastRoute({
-        storePath,
-        sessionKey: mainSessionKey,
-        deliveryContext: {
-          channel: "wemp",
-          to: openId,
-          accountId: account.accountId,
-        },
-        ctx,
-      });
-    } catch (err) {
-      console.warn(`[wemp:${account.accountId}] updateLastRoute failed:`, err);
+  // 5. 记录会话元数据 + 6. 更新最后路由（优先走 OpenClaw 的统一封装）
+  if (resolveStorePath) {
+    const storePath = resolveStorePath(cfg.session?.store, { agentId });
+    if (recordInboundSession) {
+      try {
+        await recordInboundSession({
+          storePath,
+          sessionKey: ctx.SessionKey ?? sessionKey,
+          ctx,
+          onRecordError: (err: unknown) => {
+            logWarn(runtime, `[wemp:${account.accountId}] recordInboundSession meta failed:`, err);
+          },
+          updateLastRoute: {
+            sessionKey: mainSessionKey,
+            channel: "wemp",
+            to: openId,
+            accountId: account.accountId,
+          },
+        });
+      } catch (err) {
+        logWarn(runtime, `[wemp:${account.accountId}] recordInboundSession failed:`, err);
+      }
+    } else {
+      // Back-compat fallback for older runtimes
+      if (recordSessionMetaFromInbound) {
+        try {
+          await recordSessionMetaFromInbound({
+            storePath,
+            sessionKey: ctx.SessionKey ?? sessionKey,
+            ctx,
+          });
+        } catch (err) {
+          logWarn(runtime, `[wemp:${account.accountId}] recordSessionMetaFromInbound failed:`, err);
+        }
+      }
+      if (updateLastRoute) {
+        try {
+          await updateLastRoute({
+            storePath,
+            sessionKey: mainSessionKey,
+            deliveryContext: {
+              channel: "wemp",
+              to: openId,
+              accountId: account.accountId,
+            },
+            ctx,
+          });
+        } catch (err) {
+          logWarn(runtime, `[wemp:${account.accountId}] updateLastRoute failed:`, err);
+        }
+      }
     }
   }
 
@@ -330,12 +362,12 @@ export async function dispatchWempMessage(params: {
               try {
                 const result = await sendImageByUrl(account, openId, imageUrl);
                 if (!isOk(result)) {
-                  console.warn(`[wemp:${account.accountId}] 发送图片失败: ${result.error}`);
+                  logWarn(runtime, `[wemp:${account.accountId}] 发送图片失败: ${result.error}`);
                 } else {
                   imagesSent += 1;
                 }
               } catch (err) {
-                console.warn(`[wemp:${account.accountId}] 发送图片异常: ${err}`);
+                logWarn(runtime, `[wemp:${account.accountId}] 发送图片异常: ${err}`);
               }
             }
           }
@@ -360,17 +392,17 @@ export async function dispatchWempMessage(params: {
           } catch {}
         },
         onError: (err: any, info: any) => {
-          console.error(`[wemp:${account.accountId}] ${info?.kind || "reply"} 失败:`, err);
+          logError(runtime, `[wemp:${account.accountId}] ${info?.kind || "reply"} 失败:`, err);
         },
       },
       replyOptions: {},
     });
 
     if (!queuedFinal) {
-      console.log(`[wemp:${account.accountId}] 没有生成回复`);
+      logInfo(runtime, `[wemp:${account.accountId}] 没有生成回复`);
     }
   } catch (err) {
-    console.error(`[wemp:${account.accountId}] 消息分发失败:`, err);
+    logError(runtime, `[wemp:${account.accountId}] 消息分发失败:`, err);
     // 发送错误消息
     if (!captureReplies) {
       await sendCustomMessage(account, openId, "抱歉，处理消息时出现错误，请稍后再试。");

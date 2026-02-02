@@ -3,7 +3,7 @@
   "channels": ["wemp"],
   "configSchema": {
     "type": "object",
-    "additionalProperties": false,
+    "additionalProperties": true,
     "properties": {}
   }
 }

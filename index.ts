@@ -1,43 +1,25 @@
 import type { OpenclawPluginApi } from "openclaw/plugin-sdk";
+import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { wechatMpPlugin } from "./src/channel.js";
+import { logError, logInfo, logWarn } from "./src/log.js";
 import { setWechatMpRuntime } from "./src/runtime.js";
 import { handleWechatMpWebhookRequest } from "./src/webhook-handler.js";
-import { verifyPairingCode } from "./src/pairing.js";
 import { sendCustomMessage, createMenu, deleteMenu, getMenu, createMenuFromConfig, syncMenuWithAiAssistant } from "./src/api.js";
 import { resolveWechatMpAccount } from "./src/config.js";
-
-// 扩展 API 类型以包含 registerCommand
-interface ExtendedPluginApi extends OpenclawPluginApi {
-  registerCommand: (command: {
-    name: string;
-    description: string;
-    acceptsArgs?: boolean;
-    requireAuth?: boolean;
-    handler: (ctx: {
-      senderId?: string;
-      channel?: string;
-      args?: string;
-      config?: any;
-      isAuthorizedSender?: boolean;
-    }) => Promise<{ text: string }>;
-  }) => void;
-  config: any;
-}
 
 const plugin = {
   id: "wemp",
   name: "微信公众号",
   description: "微信公众号渠道插件 (服务号客服消息)",
+  configSchema: emptyPluginConfigSchema(),
   register(api: OpenclawPluginApi) {
-    const extApi = api as ExtendedPluginApi;
-
     setWechatMpRuntime(api.runtime);
     api.registerChannel({ plugin: wechatMpPlugin });
     api.registerHttpHandler(handleWechatMpWebhookRequest);
 
     // 启动时同步菜单（异步执行，不阻塞启动）
     // 只有显式开启 syncMenu: true 才会同步
-    const cfg = extApi.config;
+    const cfg = (api as any).config;
     const wempCfg = cfg?.channels?.wemp;
     if (wempCfg?.enabled && wempCfg?.syncMenu === true) {
       setImmediate(async () => {
@@ -46,19 +28,38 @@ const plugin = {
           if (account) {
             const result = await syncMenuWithAiAssistant(account, cfg);
             if (result.action !== "unchanged") {
-              console.log(`[wemp] 菜单同步: ${result.message}`);
+              logInfo(api.runtime, `[wemp] 菜单同步: ${result.message}`);
             }
           }
         } catch (err) {
-          console.error("[wemp] 菜单同步失败:", err);
+          logError(api.runtime, "[wemp] 菜单同步失败:", err);
         }
       });
     }
 
+    const registerCommand = (api as any).registerCommand as undefined | ((command: {
+      name: string;
+      description: string;
+      acceptsArgs?: boolean;
+      requireAuth?: boolean;
+      handler: (ctx: {
+        senderId?: string;
+        channel?: string;
+        args?: string;
+        config?: any;
+        isAuthorizedSender?: boolean;
+      }) => Promise<{ text: string }>;
+    }) => void);
+
+    if (!registerCommand) {
+      logWarn(api.runtime, "[wemp] registerCommand not available in this OpenClaw runtime; /pair and /wemp-menu will be disabled.");
+      return;
+    }
+
     // 注册 /pair 命令，用于跨渠道配对
-    extApi.registerCommand({
+    registerCommand({
       name: "pair",
-      description: "配对微信公众号账号 (用法: /pair wemp <配对码>)",
+      description: "批准微信公众号配对请求 (用法: /pair wemp <配对码>)",
       acceptsArgs: true,
       requireAuth: false,  // 不使用内置授权检查，我们自己检查
       handler: async (ctx) => {
@@ -67,7 +68,7 @@ const plugin = {
 
         // 检查是否是授权用户（只有授权用户才能批准配对）
         // 从配置文件读取允许使用 /pair 命令的用户列表
-        const cfg = ctx.config || extApi.config;
+        const cfg = ctx.config || (api as any).config;
         const wempCfg = (cfg as any)?.channels?.wemp;
         const pairAllowFrom: string[] = wempCfg?.pairAllowFrom || [];
 
@@ -110,7 +111,7 @@ const plugin = {
         }
 
         const channel = parts[0].toLowerCase();
-        const code = parts[1];
+        const codeRaw = parts[1];
 
         // 只处理 wemp 渠道
         if (channel !== "wemp" && channel !== "wechat") {
@@ -119,52 +120,44 @@ const plugin = {
           };
         }
 
-        // 验证配对码格式
-        if (!/^\d{6}$/.test(code)) {
+        const code = String(codeRaw ?? "").trim().toUpperCase();
+        if (!code) {
+          return { text: "配对码不能为空。" };
+        }
+
+        const runCommandWithTimeout = (api as any)?.runtime?.system?.runCommandWithTimeout as
+          | undefined
+          | ((argv: string[], opts: any) => Promise<{ stdout: string; stderr: string; code: number | null }>);
+        if (typeof runCommandWithTimeout !== "function") {
           return {
-            text: "配对码格式错误，应为 6 位数字。",
+            text: "⚠️ 当前 OpenClaw runtime 不支持执行 CLI 命令，无法使用 /pair 自动批准。\n\n" +
+              `请在服务器上手动执行：openclaw pairing approve --channel wemp ${code} --notify`,
           };
         }
 
-        // 验证配对码
-        const result = verifyPairingCode(
-          code,
-          ctx.senderId || "unknown",
-          ctx.senderId, // 使用 senderId 作为用户名
-          ctx.channel || "unknown"
+        // 通过 OpenClaw CLI 批准 pairing code（会写入 allowFrom store，并触发 --notify 回调）
+        const result = await runCommandWithTimeout(
+          ["openclaw", "pairing", "approve", "--channel", "wemp", code, "--notify"],
+          { timeoutMs: 15_000 },
         );
 
-        if (!result) {
+        if (result?.code && result.code !== 0) {
+          const stderr = String(result.stderr ?? "").trim();
           return {
-            text: "配对失败：配对码无效或已过期。\n\n请在微信公众号中重新发送「配对」获取新的配对码。",
+            text: `❌ 批准失败（code=${result.code}）。\n\n` +
+              (stderr ? `错误信息：\n${stderr}\n\n` : "") +
+              `你可以在服务器上重试：openclaw pairing approve --channel wemp ${code} --notify`,
           };
-        }
-
-        // 通知微信用户配对成功
-        try {
-          const account = resolveWechatMpAccount(cfg, result.accountId);
-          if (account) {
-            await sendCustomMessage(
-              account,
-              result.openId,
-              `🎉 配对成功！\n\n` +
-                `已与 ${ctx.senderId || "未知用户"} 绑定。\n` +
-                `配对渠道: ${ctx.channel || "未知"}\n\n` +
-                `现在你可以使用完整的 AI 助手功能了。`
-            );
-          }
-        } catch (err) {
-          console.error("[wemp] 发送配对成功通知失败:", err);
         }
 
         return {
-          text: `✅ 配对成功！\n\n微信用户已绑定到你的账号。`,
+          text: `✅ 已批准配对请求。\n\n如果你使用了 --notify，公众号用户会收到配对成功通知。`,
         };
       },
     });
 
     // 注册 /wemp-menu 命令，用于管理自定义菜单
-    extApi.registerCommand({
+    registerCommand({
       name: "wemp-menu",
       description: "管理微信公众号自定义菜单 (用法: /wemp-menu create|delete|get)",
       acceptsArgs: true,
@@ -172,7 +165,7 @@ const plugin = {
       handler: async (ctx) => {
         const args = ctx.args?.trim() || "";
         const action = args.split(/\s+/)[0]?.toLowerCase();
-        const cfg = ctx.config || extApi.config;
+        const cfg = ctx.config || (api as any).config;
         const account = resolveWechatMpAccount(cfg, "default");
 
         if (!account) {

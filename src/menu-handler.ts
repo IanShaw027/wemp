@@ -6,10 +6,12 @@ import type { ResolvedWechatMpAccount } from "./types.js";
 import { sendCustomMessage, sendImageMessage, sendVoiceMessage } from "./api.js";
 import { isOk } from "./result.js";
 import { getMenuPayload } from "./menu-payload.js";
-import { isPaired, getPairedUser, generatePairingCode, unpair } from "./pairing.js";
+import { isPaired, requestPairing, setOptOut } from "./pairing.js";
 import { dispatchWempMessage } from "./message-dispatcher.js";
 import { isAiAssistantEnabled, enableAiAssistant, disableAiAssistant } from "./ai-assistant-state.js";
 import { getUsageLimitToday } from "./usage-limit-tracker.js";
+import { logInfo, logWarn } from "./log.js";
+import { SAFE_CONTROL_COMMANDS, resolveCommandToken } from "./commands.js";
 
 /**
  * 检查是否是菜单 payload ID 格式
@@ -41,43 +43,118 @@ export async function handleSpecialCommand(
   account: ResolvedWechatMpAccount,
   openId: string,
   content: string,
-  agentConfigByAccountId?: Map<string, { agentPaired: string; agentUnpaired: string }>
+  opts?: {
+    agentConfigByAccountId?: Map<string, { agentPaired: string; agentUnpaired: string }>;
+    runtime?: any;
+    cfg?: any;
+  }
 ): Promise<boolean> {
+  const runtime = opts?.runtime;
+  const cfg = opts?.cfg;
+  const agentConfigByAccountId = opts?.agentConfigByAccountId;
+  const subjectId = `${account.accountId}:${openId}`;
+
   // 配对命令
   if (content === "配对" || content === "绑定") {
-    if (isPaired(account.accountId, openId)) {
-      const user = getPairedUser(account.accountId, openId);
+    // Always clear local opt-out when user asks to pair.
+    try {
+      setOptOut(account.accountId, openId, false);
+    } catch {
+      // ignore
+    }
+
+    const paired = runtime
+      ? await isPaired({ runtime, accountId: account.accountId, openId })
+      : false;
+
+    if (paired) {
       await sendCustomMessage(
         account,
         openId,
         `你已经配对过了 ✅\n\n` +
-          `配对时间: ${user ? new Date(user.pairedAt).toLocaleString("zh-CN") : "未知"}\n` +
-          `配对账号: ${user?.pairedByName || user?.pairedBy || "未知"}\n` +
-          `配对渠道: ${user?.pairedByChannel || "未知"}\n\n` +
-          `发送「解除配对」可以取消绑定。`
+          `你的 ID: ${subjectId}\n\n` +
+          `发送「解除配对」可以切换为客服模式（本地生效）。\n` +
+          `如需彻底移除授权，请联系管理员从 OpenClaw 的 wemp allowFrom 记录中移除该 ID。`
       );
-    } else {
-      const code = generatePairingCode(account.accountId, openId);
+      return true;
+    }
+
+    if (!runtime) {
       await sendCustomMessage(
         account,
         openId,
-        `🔗 配对码: ${code}\n\n` +
-          `请在 5 分钟内，通过其他已授权渠道（如 Telegram、QQ）发送以下命令完成配对：\n\n` +
-          `/pair wemp ${code}\n\n` +
-          `配对后，你将获得完整的 AI 助手功能。`
+        `⚠️ 当前 OpenClaw runtime 不支持配对流程。\n\n` +
+          `请联系管理员检查 wemp 插件加载是否正常。`
       );
+      return true;
     }
+
+    let requestCode = "";
+    let created = false;
+    try {
+      const req = await requestPairing({
+        runtime,
+        accountId: account.accountId,
+        openId,
+        meta: { accountId: account.accountId },
+      });
+      requestCode = req.code;
+      created = req.created;
+    } catch (err) {
+      await sendCustomMessage(
+        account,
+        openId,
+        `❌ 创建配对请求失败：${String(err)}\n\n请稍后重试。`
+      );
+      return true;
+    }
+
+    if (!requestCode) {
+      await sendCustomMessage(
+        account,
+        openId,
+        `⚠️ 配对请求过多，暂时无法创建新的配对码。\n\n请稍后再试。`
+      );
+      return true;
+    }
+
+    const approveHint = `openclaw pairing approve wemp ${requestCode} --notify`;
+    const approveHintAlt = `/pair wemp ${requestCode}`;
+    const header = created ? "🔐 已创建配对请求" : "🔐 你已有一个待审批的配对请求";
+    const body =
+      `${header}\n\n` +
+      `你的 ID: ${subjectId}\n` +
+      `配对码: ${requestCode}\n` +
+      `有效期: 1 小时\n\n` +
+      `请让管理员批准配对（任选一种方式）：\n` +
+      `A) 服务器执行：\n${approveHint}\n\n` +
+      `B) 在任意已授权渠道发送：\n${approveHintAlt}\n\n` +
+      `批准后，你将获得完整的 AI 助手功能。`;
+    await sendCustomMessage(account, openId, body);
     return true;
   }
 
   // 解除配对
   if (content === "解除配对" || content === "取消绑定") {
-    if (isPaired(account.accountId, openId)) {
-      unpair(account.accountId, openId);
+    // OpenClaw allowFrom store is owner-managed; here we only provide a local opt-out.
+    try {
+      setOptOut(account.accountId, openId, true);
+    } catch {
+      // ignore
+    }
+
+    const paired = runtime
+      ? await isPaired({ runtime, accountId: account.accountId, openId })
+      : false;
+
+    if (paired) {
       await sendCustomMessage(
         account,
         openId,
-        `已解除配对 ✅\n\n你现在使用的是客服模式，功能有所限制。发送「配对」可以重新绑定。`
+        `已解除配对 ✅\n\n` +
+          `你现在使用的是客服模式（本地）。发送「配对」可以恢复完整模式。\n\n` +
+          `提示：管理员端的授权记录仍可能存在（OpenClaw wemp allowFrom）。\n` +
+          `如需彻底取消授权，请联系管理员移除 ID: ${subjectId}`
       );
     } else {
       await sendCustomMessage(account, openId, `你还没有配对过哦，发送「配对」开始绑定。`);
@@ -87,8 +164,9 @@ export async function handleSpecialCommand(
 
   // 查看状态
   if (content === "状态" || content === "/status") {
-    const paired = isPaired(account.accountId, openId);
-    const user = getPairedUser(account.accountId, openId);
+    const paired = runtime
+      ? await isPaired({ runtime, accountId: account.accountId, openId })
+      : false;
     const mode = paired ? "🔓 完整模式（个人助理）" : "🔒 客服模式";
 
     // 使用账户特定的 agent 配置
@@ -101,12 +179,8 @@ export async function handleSpecialCommand(
     let statusMsg = `当前状态: ${mode}\n`;
     statusMsg += `AI 助手: ${aiEnabled ? "✅ 已开启" : "❌ 已关闭"}\n`;
     statusMsg += `Agent: ${agentId}\n`;
-    if (paired && user) {
-      statusMsg += `配对时间: ${new Date(user.pairedAt).toLocaleString("zh-CN")}\n`;
-      statusMsg += `配对账号: ${user.pairedByName || user.pairedBy || "未知"}\n`;
-      statusMsg += `配对渠道: ${user.pairedByChannel || "未知"}\n`;
-    }
-    statusMsg += `\n发送「配对」可以${paired ? "查看配对信息" : "绑定账号获取完整功能"}。`;
+    statusMsg += `ID: ${account.accountId}:${openId}\n`;
+    statusMsg += `\n发送「配对」可以${paired ? "查看当前授权" : "申请绑定账号获取完整功能"}。`;
     if (!aiEnabled) {
       statusMsg += `\n点击菜单「AI助手」->「开启AI助手」开始使用。`;
     }
@@ -161,7 +235,7 @@ export async function handleMenuClick(
 
   // 特殊菜单处理（发送链接）
   const wempCfg = cfg?.channels?.wemp;
-  console.log(`[wemp:${account.accountId}] 菜单事件: ${eventKey}, wempCfg存在: ${!!wempCfg}`);
+  logInfo(runtime, `[wemp:${account.accountId}] 菜单事件: ${eventKey}, wempCfg存在: ${!!wempCfg}`);
 
   // ============ 业务菜单处理 ============
   // 了解AI - 基础入门
@@ -227,7 +301,7 @@ export async function handleMenuClick(
     const tokenLimit = usageLimit.dailyTokens || 0;    // 0 表示无限制
     
     // 获取正确的 agentId
-    const paired = isPaired(account.accountId, openId);
+    const paired = await isPaired({ runtime, accountId: account.accountId, openId });
     const agentCfg = getAgentConfig(account.accountId, agentConfigByAccountId);
     const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
 
@@ -321,7 +395,7 @@ export async function handleMenuClick(
       await sendCustomMessage(account, openId, textToSend);
       return;
     } catch (err) {
-      console.warn(`[wemp:${account.accountId}] 获取使用统计失败:`, err);
+      logWarn(runtime, `[wemp:${account.accountId}] 获取使用统计失败:`, err);
       await sendCustomMessage(account, openId, "📊 使用统计\n\n暂无统计数据。");
       return;
     }
@@ -329,18 +403,18 @@ export async function handleMenuClick(
 
   if (eventKey === "CMD_ARTICLES") {
     const articlesUrl = wempCfg?.articlesUrl || "https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz=MzI0NTc0NTEwNQ==&scene=124#wechat_redirect";
-    console.log(`[wemp:${account.accountId}] 发送历史文章链接: ${articlesUrl}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 发送历史文章链接: ${articlesUrl}`);
     // 微信可能过滤某些链接，尝试不同格式
     const result = await sendCustomMessage(account, openId, `📚 查看历史文章\n\n${articlesUrl}`);
-    console.log(`[wemp:${account.accountId}] 发送结果: ${JSON.stringify(result)}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 发送结果: ${JSON.stringify(result)}`);
     return;
   }
 
   if (eventKey === "CMD_WEBSITE") {
     const websiteUrl = wempCfg?.websiteUrl || "https://kilan.cn";
-    console.log(`[wemp:${account.accountId}] 发送官网链接: ${websiteUrl}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 发送官网链接: ${websiteUrl}`);
     const result = await sendCustomMessage(account, openId, `🌐 官网\n\n访问：${websiteUrl}`);
-    console.log(`[wemp:${account.accountId}] 发送结果: ${JSON.stringify(result)}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 发送结果: ${JSON.stringify(result)}`);
     return;
   }
 
@@ -358,7 +432,7 @@ export async function handleMenuClick(
     const suffix = eventKey.slice("BACKEND_TEXT_".length);
     const stored = getMenuPayload(account.accountId, suffix);
     if (!stored && isLikelyMenuPayloadId(suffix)) {
-      console.warn(`[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
+      logWarn(runtime, `[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
       await sendCustomMessage(account, openId, "⚠️ 菜单内容已失效（本地缓存丢失）。请重新同步菜单后再试。");
       return;
     }
@@ -372,7 +446,7 @@ export async function handleMenuClick(
           return parts.slice(3).join("_");
         })();
 
-    console.log(`[wemp:${account.accountId}] 后台菜单点击(文字)，原始值: ${originalValue}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 后台菜单点击(文字)，原始值: ${originalValue}`);
 
     // 检查是否有自定义的菜单响应配置
     const menuResponses = wempCfg?.menuResponses || {};
@@ -384,7 +458,7 @@ export async function handleMenuClick(
     // 如果没有配置响应，将原始值作为消息发送给 AI 处理
     const aiEnabled = isAiAssistantEnabled(account.accountId, openId);
     if (!aiEnabled) {
-      console.log(`[wemp:${account.accountId}] 用户 ${openId.slice(0, 8)}... 的 AI 助手已关闭，跳过后台菜单文字处理`);
+      logInfo(runtime, `[wemp:${account.accountId}] 用户 ${openId.slice(0, 8)}... 的 AI 助手已关闭，跳过后台菜单文字处理`);
       const wempCfg = cfg?.channels?.wemp;
       const disabledHint = wempCfg?.aiDisabledHint ?? "AI 助手当前已关闭，请点击菜单「AI助手」->「开启AI助手」来开启。";
       // 只有当 disabledHint 非空时才发送消息
@@ -394,7 +468,7 @@ export async function handleMenuClick(
       return;
     }
 
-    const paired = isPaired(account.accountId, openId);
+    const paired = await isPaired({ runtime, accountId: account.accountId, openId });
     const agentCfg = getAgentConfig(account.accountId, agentConfigByAccountId);
     const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
 
@@ -416,7 +490,7 @@ export async function handleMenuClick(
     const suffix = eventKey.slice("BACKEND_NEWS_".length);
     const stored = getMenuPayload(account.accountId, suffix);
     if (!stored && isLikelyMenuPayloadId(suffix)) {
-      console.warn(`[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
+      logWarn(runtime, `[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
       await sendCustomMessage(account, openId, "⚠️ 菜单内容已失效（本地缓存丢失）。请重新同步菜单后再试。");
       return;
     }
@@ -442,7 +516,7 @@ export async function handleMenuClick(
           }
         })();
 
-    console.log(`[wemp:${account.accountId}] 后台菜单点击(图文)，标题: ${title}, URL: ${contentUrl}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 后台菜单点击(图文)，标题: ${title}, URL: ${contentUrl}`);
 
     if (contentUrl) {
       // 发送图文链接
@@ -458,7 +532,7 @@ export async function handleMenuClick(
     const suffix = eventKey.slice("BACKEND_IMG_".length);
     const stored = getMenuPayload(account.accountId, suffix);
     if (!stored && isLikelyMenuPayloadId(suffix)) {
-      console.warn(`[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
+      logWarn(runtime, `[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
       await sendCustomMessage(account, openId, "⚠️ 菜单内容已失效（本地缓存丢失）。请重新同步菜单后再试。");
       return;
     }
@@ -469,7 +543,7 @@ export async function handleMenuClick(
           return parts.slice(3).join("_");
         })();
 
-    console.log(`[wemp:${account.accountId}] 后台菜单点击(图片)，mediaId: ${mediaId}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 后台菜单点击(图片)，mediaId: ${mediaId}`);
 
     if (mediaId) {
       // 尝试发送图片（注意：后台设置的是临时素材，可能已过期）
@@ -488,7 +562,7 @@ export async function handleMenuClick(
     const suffix = eventKey.slice("BACKEND_VOICE_".length);
     const stored = getMenuPayload(account.accountId, suffix);
     if (!stored && isLikelyMenuPayloadId(suffix)) {
-      console.warn(`[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
+      logWarn(runtime, `[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
       await sendCustomMessage(account, openId, "⚠️ 菜单内容已失效（本地缓存丢失）。请重新同步菜单后再试。");
       return;
     }
@@ -499,13 +573,13 @@ export async function handleMenuClick(
           return parts.slice(3).join("_");
         })();
 
-    console.log(`[wemp:${account.accountId}] 后台菜单点击(语音)，mediaId: ${mediaId}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 后台菜单点击(语音)，mediaId: ${mediaId}`);
 
     if (mediaId) {
       // 尝试发送语音（注意：后台设置的是临时素材，可能已过期）
       const result = await sendVoiceMessage(account, openId, mediaId);
       if (!isOk(result)) {
-        console.warn(`[wemp:${account.accountId}] 发送语音失败: ${result.error}`);
+        logWarn(runtime, `[wemp:${account.accountId}] 发送语音失败: ${result.error}`);
         await sendCustomMessage(account, openId, "抱歉，语音素材已过期或不可用。");
       }
     } else {
@@ -519,7 +593,7 @@ export async function handleMenuClick(
     const suffix = eventKey.slice("BACKEND_VIDEO_".length);
     const stored = getMenuPayload(account.accountId, suffix);
     if (!stored && isLikelyMenuPayloadId(suffix)) {
-      console.warn(`[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
+      logWarn(runtime, `[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
       await sendCustomMessage(account, openId, "⚠️ 菜单内容已失效（本地缓存丢失）。请重新同步菜单后再试。");
       return;
     }
@@ -530,7 +604,7 @@ export async function handleMenuClick(
           return parts.slice(3).join("_");
         })();
 
-    console.log(`[wemp:${account.accountId}] 后台菜单点击(视频)，值: ${videoValue}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 后台菜单点击(视频)，值: ${videoValue}`);
 
     if (videoValue) {
       // 判断是 URL 还是 media_id
@@ -557,7 +631,7 @@ export async function handleMenuClick(
     const suffix = eventKey.slice("BACKEND_FINDER_".length);
     const stored = getMenuPayload(account.accountId, suffix);
     if (!stored && isLikelyMenuPayloadId(suffix)) {
-      console.warn(`[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
+      logWarn(runtime, `[wemp:${account.accountId}] 菜单 payload 丢失: ${eventKey}`);
       await sendCustomMessage(account, openId, "⚠️ 菜单内容已失效（本地缓存丢失）。请重新同步菜单后再试。");
       return;
     }
@@ -568,7 +642,7 @@ export async function handleMenuClick(
           return parts.slice(3).join("_");
         })();
 
-    console.log(`[wemp:${account.accountId}] 后台菜单点击(视频号动态)，ID: ${finderId}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 后台菜单点击(视频号动态)，ID: ${finderId}`);
 
     // 视频号动态暂不支持通过客服消息发送
     await sendCustomMessage(account, openId, "抱歉，视频号动态暂不支持通过此方式发送。");
@@ -577,57 +651,46 @@ export async function handleMenuClick(
 
   // BACKEND_UNKNOWN_*: 未知类型（带原始类型信息）
   if (eventKey.startsWith("BACKEND_UNKNOWN_")) {
-    console.log(`[wemp:${account.accountId}] 未知类型的后台菜单点击: ${eventKey}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 未知类型的后台菜单点击: ${eventKey}`);
     await sendCustomMessage(account, openId, "抱歉，该菜单功能暂不支持。");
     return;
   }
 
   // BACKEND_EMPTY_*: 空菜单
   if (eventKey.startsWith("BACKEND_EMPTY_")) {
-    console.log(`[wemp:${account.accountId}] 空菜单点击: ${eventKey}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 空菜单点击: ${eventKey}`);
     await sendCustomMessage(account, openId, "抱歉，该菜单未配置内容。");
     return;
   }
 
   // UNKNOWN_*: 旧格式未知类型（兼容）
   if (eventKey.startsWith("UNKNOWN_")) {
-    console.log(`[wemp:${account.accountId}] 未知类型的后台菜单点击: ${eventKey}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 未知类型的后台菜单点击: ${eventKey}`);
     await sendCustomMessage(account, openId, "抱歉，该菜单功能暂不支持。");
     return;
   }
 
   const command = menuCommands[eventKey];
   if (!command) {
-    console.log(`[wemp:${account.accountId}] 未知的菜单事件: ${eventKey}`);
+    logInfo(runtime, `[wemp:${account.accountId}] 未知的菜单事件: ${eventKey}`);
     return;
   }
 
   // 对于内置命令，模拟用户发送消息
-  console.log(`[wemp:${account.accountId}] 执行菜单命令: ${command}`);
+  logInfo(runtime, `[wemp:${account.accountId}] 执行菜单命令: ${command}`);
 
   // 检查是否是特殊命令（配对、状态等）
   if (command === "配对" || command === "状态") {
-    await handleSpecialCommand(account, openId, command, agentConfigByAccountId);
+    await handleSpecialCommand(account, openId, command, { agentConfigByAccountId, runtime, cfg });
     return;
   }
 
   // 获取正确的 agentId 和 sessionKey
-  const paired = isPaired(account.accountId, openId);
+  const paired = await isPaired({ runtime, accountId: account.accountId, openId });
   const agentCfg = getAgentConfig(account.accountId, agentConfigByAccountId);
   const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
-  const commandToken = command.trim().split(/\s+/u)[0]?.toLowerCase() ?? command.toLowerCase();
-  const safeCommands = new Set<string>([
-    "/help",
-    "/commands",
-    "/status",
-    "/new",
-    "/reset",
-    "/clear",
-    "/undo",
-    "/usage",
-    "/stop",
-  ]);
-  const forceCommandAuthorized = paired || safeCommands.has(commandToken);
+  const commandToken = resolveCommandToken(command);
+  const forceCommandAuthorized = paired || SAFE_CONTROL_COMMANDS.has(commandToken);
 
   // 统一走消息分发流程，让 OpenClaw 自己处理 /new、/clear、/help 等内置命令。
   // 这样避免依赖不存在的 runtime.channel.commands.dispatchControlCommand。

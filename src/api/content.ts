@@ -5,6 +5,7 @@
 import { uploadArticleImage } from "../api.js";
 import type { ResolvedWechatMpAccount } from "../types.js";
 import { type Result, ok, err } from "../result.js";
+import { logWarn } from "../log.js";
 
 /**
  * 处理文章内容中的图片
@@ -47,7 +48,7 @@ export async function processArticleImages(
         uploadedUrls.set(originalUrl, result.data);
         processedContent = processedContent.split(originalUrl).join(result.data);
       } else {
-        console.warn(`[wemp] 上传图片失败: ${originalUrl} - ${result.error}`);
+        logWarn(`[wemp] 上传图片失败: ${originalUrl} - ${result.error}`);
       }
     }
 

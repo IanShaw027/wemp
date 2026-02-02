@@ -4,6 +4,7 @@
 import * as crypto from "crypto";
 import type { ResolvedWechatMpAccount, WechatMpMessage } from "./types.js";
 import { type Result, ok, err } from "./result.js";
+import { logWarn } from "./log.js";
 
 /**
  * 验证普通签名
@@ -57,7 +58,7 @@ export function decryptMessage(encodingAESKey: string, appId: string, encrypt: s
 
   // 验证 AppID
   if (extractedAppId !== appId) {
-    console.warn(`[wemp] AppID 不匹配: ${extractedAppId} !== ${appId}`);
+    logWarn(`[wemp] AppID 不匹配: ${extractedAppId} !== ${appId}`);
   }
 
   return msg;

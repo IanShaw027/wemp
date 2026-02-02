@@ -4,6 +4,7 @@
  */
 import * as path from "node:path";
 import { getDataDir, JsonStore } from "./storage.js";
+import { logInfo } from "./log.js";
 
 // 数据存储路径
 const DATA_DIR = getDataDir();
@@ -56,7 +57,7 @@ export function enableAiAssistant(accountId: string, openId: string): void {
     };
     return states;
   });
-  console.log(`[wemp:ai-state] 用户 ${openId.slice(0, 8)}... 开启了 AI 助手`);
+  logInfo(`[wemp:ai-state] 用户 ${openId.slice(0, 8)}... 开启了 AI 助手`);
 }
 
 /**
@@ -71,7 +72,7 @@ export function disableAiAssistant(accountId: string, openId: string): void {
     };
     return states;
   });
-  console.log(`[wemp:ai-state] 用户 ${openId.slice(0, 8)}... 关闭了 AI 助手`);
+  logInfo(`[wemp:ai-state] 用户 ${openId.slice(0, 8)}... 关闭了 AI 助手`);
 }
 
 /**

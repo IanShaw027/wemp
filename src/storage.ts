@@ -4,6 +4,32 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { logError } from "./log.js";
+
+function sleepSync(ms: number): void {
+  const delayMs = Math.max(0, Math.trunc(ms));
+  if (delayMs <= 0) return;
+
+  // Prefer Atomics.wait to avoid CPU busy-wait.
+  try {
+    // eslint-disable-next-line no-undef
+    if (typeof Atomics !== "undefined" && typeof SharedArrayBuffer !== "undefined") {
+      // eslint-disable-next-line no-undef
+      const sab = new SharedArrayBuffer(4);
+      const ia = new Int32Array(sab);
+      // eslint-disable-next-line no-undef
+      Atomics.wait(ia, 0, 0, delayMs);
+      return;
+    }
+  } catch {
+    // fall back below
+  }
+
+  const start = Date.now();
+  while (Date.now() - start < delayMs) {
+    // busy-wait fallback (should be rare)
+  }
+}
 
 /**
  * 获取数据存储目录路径
@@ -19,7 +45,7 @@ export function getDataDir(): string {
  */
 export function ensureDir(dirPath: string): void {
   if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
+    fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
   }
 }
 
@@ -46,7 +72,7 @@ export function readJsonFile<T>(filePath: string, defaultValue: T): T {
     const content = fs.readFileSync(filePath, "utf-8");
     return JSON.parse(content) as T;
   } catch (error) {
-    console.error(`[wemp:storage] 读取 JSON 文件失败 (${filePath}):`, error);
+    logError(`[wemp:storage] 读取 JSON 文件失败 (${filePath}):`, error);
     return defaultValue;
   }
 }
@@ -63,8 +89,13 @@ export function writeJsonFile<T>(filePath: string, data: T): void {
 
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
+    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
     fs.renameSync(tmp, filePath);
+    try {
+      fs.chmodSync(filePath, 0o600);
+    } catch {
+      // ignore chmod errors on unusual filesystems
+    }
   } finally {
     try {
       if (fs.existsSync(tmp)) {
@@ -121,5 +152,87 @@ export class JsonStore<T> {
     const current = this.read();
     const updated = updater(current);
     this.write(updated);
+  }
+}
+
+export type FileLockOptions = {
+  /** Max time to wait for lock before failing */
+  timeoutMs?: number;
+  /** Consider lock stale after this time */
+  staleMs?: number;
+};
+
+/**
+ * Best-effort file lock (single-host).
+ * Uses an adjacent lock file created with O_EXCL to avoid concurrent writers.
+ */
+export function withFileLock<T>(
+  filePath: string,
+  fn: () => T,
+  options?: FileLockOptions,
+): T {
+  const timeoutMs = Math.max(0, Math.trunc(options?.timeoutMs ?? 5_000));
+  const staleMs = Math.max(1_000, Math.trunc(options?.staleMs ?? 30_000));
+
+  const dir = path.dirname(filePath);
+  ensureDir(dir);
+
+  const lockPath = `${filePath}.lock`;
+  const startedAt = Date.now();
+
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      try {
+        fs.writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`, { encoding: "utf-8" });
+      } catch {
+        // ignore
+      } finally {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // ignore
+        }
+      }
+      break;
+    } catch (err) {
+      const code = (err as any)?.code;
+      if (code !== "EEXIST") {
+        throw err;
+      }
+
+      // Check staleness
+      try {
+        const stat = fs.statSync(lockPath);
+        const age = Date.now() - stat.mtimeMs;
+        if (age > staleMs) {
+          try {
+            fs.unlinkSync(lockPath);
+            continue;
+          } catch {
+            // another process may have removed it; fall through to wait
+          }
+        }
+      } catch {
+        // lock disappeared between checks; retry
+        continue;
+      }
+
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error(`Timeout acquiring lock for ${filePath}`);
+      }
+
+      sleepSync(25);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      // ignore unlock errors
+    }
   }
 }

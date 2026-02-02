@@ -12,7 +12,7 @@
   <a href="https://github.com/IanShaw027/wemp/network/members"><img src="https://img.shields.io/github/forks/IanShaw027/wemp?style=flat-square&logo=github" alt="GitHub forks"></a>
   <a href="https://github.com/IanShaw027/wemp/issues"><img src="https://img.shields.io/github/issues/IanShaw027/wemp?style=flat-square" alt="GitHub issues"></a>
   <img src="https://img.shields.io/badge/Node.js-18+-43853D?style=flat-square&logo=node.js&logoColor=white" alt="Node.js">
-  <img src="https://img.shields.io/badge/OpenClaw-2024.1+-FF6B6B?style=flat-square" alt="OpenClaw">
+  <img src="https://img.shields.io/badge/OpenClaw-2026.1+-FF6B6B?style=flat-square" alt="OpenClaw">
 </p>
 
 <p align="center">
@@ -120,8 +120,8 @@ openclaw configure --section channels
      │ 发送「配对」                    │
      ▼                                │
 ┌─────────────┐                       │
-│ 返回 6 位码 │                       │
-│ (5分钟有效) │                       │
+│ 返回配对码  │                       │
+│ (1小时有效) │                       │
 └─────────────┘                       │
      │                                │
      │ ─────── 告知配对码 ──────────→ │
@@ -136,12 +136,16 @@ openclaw configure --section channels
 └─────────────┘
 ```
 
+说明：
+- 配对码由 OpenClaw pairing-store 生成（通常为 8 位大写字母/数字），有效期 1 小时。
+- 管理员也可以在服务器上直接执行：`openclaw pairing approve wemp <code> --notify`
+
 ### 用户命令
 
 | 命令 | 说明 |
 |------|------|
 | `配对` / `绑定` | 获取配对码 |
-| `解除配对` / `取消绑定` | 解除绑定 |
+| `解除配对` / `取消绑定` | 解除绑定（本地生效：切回客服模式） |
 | `状态` / `/status` | 查看配对状态 |
 
 <details>
@@ -153,7 +157,8 @@ openclaw configure --section channels
     "wemp": {
       "agentPaired": "main",
       "agentUnpaired": "wemp-cs",
-      "pairingApiToken": "your-secure-random-token"
+      "pairingApiToken": "your-secure-random-token",
+      "pairAllowFrom": ["telegram:123456789"]
     }
   }
 }
@@ -164,6 +169,7 @@ openclaw configure --section channels
 | `agentPaired` | 已配对用户使用的 Agent ID |
 | `agentUnpaired` | 未配对用户使用的 Agent ID |
 | `pairingApiToken` | 配对 API Token |
+| `pairAllowFrom` | 允许使用 `/pair wemp <配对码>` 的用户列表（跨渠道管理员） |
 
 </details>
 
@@ -308,6 +314,7 @@ AI 助手**默认关闭**，用户需要通过菜单「AI助手」→「开启AI
 | `agentPaired` | string | | 已配对用户使用的 Agent ID |
 | `agentUnpaired` | string | | 未配对用户使用的 Agent ID |
 | `pairingApiToken` | string | | 配对 API Token |
+| `pairAllowFrom` | string[] | | 允许使用 `/pair wemp <配对码>` 的用户列表 |
 
 </details>
 
