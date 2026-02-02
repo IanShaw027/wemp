@@ -9,6 +9,7 @@ import { getMenuPayload } from "./menu-payload.js";
 import { isPaired, getPairedUser, generatePairingCode, unpair } from "./pairing.js";
 import { dispatchWempMessage } from "./message-dispatcher.js";
 import { isAiAssistantEnabled, enableAiAssistant, disableAiAssistant } from "./ai-assistant-state.js";
+import { getUsageLimitToday } from "./usage-limit-tracker.js";
 
 /**
  * 检查是否是菜单 payload ID 格式
@@ -225,59 +226,105 @@ export async function handleMenuClick(
     const dailyLimit = usageLimit.dailyMessages || 0;  // 0 表示无限制
     const tokenLimit = usageLimit.dailyTokens || 0;    // 0 表示无限制
     
-    // 获取正确的 agentId 和 sessionKey
+    // 获取正确的 agentId
     const paired = isPaired(account.accountId, openId);
     const agentCfg = getAgentConfig(account.accountId, agentConfigByAccountId);
     const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
-    const sessionKey = `wemp:${agentId}:${account.accountId}:${openId}`;
-    
-    // 调用 OpenClaw 的 /usage 命令获取基础统计
-    const dispatchControlCommand = runtime?.channel?.commands?.dispatchControlCommand;
-    
-    if (dispatchControlCommand) {
-      try {
-        let usageText = "";
-        await dispatchControlCommand({
-          command: "/usage",
-          cfg,
-          channel: "wemp",
-          accountId: account.accountId,
-          sessionKey,
-          senderId: openId,
+
+    try {
+      const now = Date.now();
+      const statusText =
+        (await dispatchWempMessage({
+          account,
+          openId,
+          text: "/status",
+          messageId: `menu:${eventKey}:${now}`,
+          timestamp: now,
           agentId,
-          deliver: async (response: string) => {
-            usageText = response;
-          },
-        });
-        
-        // 添加限制信息
-        let limitInfo = "";
-        if (dailyLimit > 0 || tokenLimit > 0) {
-          limitInfo = "\n\n📊 使用限制：\n";
-          if (dailyLimit > 0) {
-            limitInfo += `• 每日消息上限：${dailyLimit} 条\n`;
-          }
-          if (tokenLimit > 0) {
-            limitInfo += `• 每日 Token 上限：${tokenLimit.toLocaleString()}\n`;
-          }
+          cfg,
+          runtime,
+          captureReplies: true,
+          // /status 和 /usage 都是安全命令：允许未配对用户查看统计
+          forceCommandAuthorized: true,
+        })) ?? "";
+
+      const usageLineRaw =
+        statusText
+          .split("\n")
+          .map((line) => line.trim())
+          .find((line) => line.includes("Usage:")) ?? "";
+      const usageLine = usageLineRaw.replace(/^.*Usage:\s*/u, "").trim();
+
+      const { dayKey, counters } = getUsageLimitToday({
+        accountId: account.accountId,
+        openId,
+      });
+
+      const usedMessages = counters.messagesIn;
+      const usedTokensEstimated = counters.tokensIn + counters.tokensOut;
+      const usedTokensInEstimated = counters.tokensIn;
+      const usedTokensOutEstimated = counters.tokensOut;
+
+      const usedTokens = usedTokensEstimated;
+      const usedTokensIn = usedTokensInEstimated;
+      const usedTokensOut = usedTokensOutEstimated;
+
+      const formatCompact = (value: number): string => {
+        const v = Math.max(0, Math.floor(value));
+        if (v < 1000) return String(v);
+        if (v < 1000 * 1000) {
+          const k = v / 1000;
+          const fixed = k >= 100 ? k.toFixed(0) : k >= 10 ? k.toFixed(1) : k.toFixed(2);
+          return `${fixed.replace(/\.0+$/u, "")}k`;
         }
-        
-        await sendCustomMessage(account, openId, usageText + limitInfo);
-        return;
-      } catch (err) {
-        console.warn(`[wemp:${account.accountId}] 获取使用统计失败:`, err);
+        const m = v / (1000 * 1000);
+        const fixed = m >= 100 ? m.toFixed(0) : m >= 10 ? m.toFixed(1) : m.toFixed(2);
+        return `${fixed.replace(/\.0+$/u, "")}m`;
+      };
+
+      const formatPct = (used: number, limit: number): string => {
+        if (limit <= 0) return "0%";
+        const pct = Math.min(999, Math.max(0, Math.round((used / limit) * 100)));
+        return `${pct}%`;
+      };
+
+      let textToSend = `📊 使用统计（${dayKey}）\n`;
+
+      if (usageLine) {
+        textToSend += `\n🪟 会话窗口占用：${usageLine}\n`;
+      } else {
+        textToSend += `\n🪟 会话窗口占用：暂无数据\n`;
       }
+
+      if (paired) {
+        textToSend += `\n🧾 今日额度（usageLimit）\n`;
+        textToSend += `• 管理者（已配对）：不受用量限制，不计入额度\n`;
+      } else {
+        // usageLimit 使用情况（按日，用户级）
+        textToSend += `\n🧾 今日额度（usageLimit）\n`;
+        if (dailyLimit > 0) {
+          textToSend += `• 消息(用户请求)：${usedMessages}/${dailyLimit} (${formatPct(usedMessages, dailyLimit)})\n`;
+        } else {
+          textToSend += `• 消息(用户请求)：${usedMessages}（未设置上限）\n`;
+        }
+
+        const tokenLabel = "Tokens(估算)";
+        if (tokenLimit > 0) {
+          textToSend += `• ${tokenLabel}(输入+输出)：${formatCompact(usedTokens)}/${formatCompact(tokenLimit)} (${formatPct(usedTokens, tokenLimit)})\n`;
+        } else {
+          textToSend += `• ${tokenLabel}(输入+输出)：${formatCompact(usedTokens)}（未设置上限）\n`;
+        }
+
+        textToSend += `  - 输入 ~${formatCompact(usedTokensIn)} / 输出 ~${formatCompact(usedTokensOut)}\n`;
+      }
+
+      await sendCustomMessage(account, openId, textToSend);
+      return;
+    } catch (err) {
+      console.warn(`[wemp:${account.accountId}] 获取使用统计失败:`, err);
+      await sendCustomMessage(account, openId, "📊 使用统计\n\n暂无统计数据。");
+      return;
     }
-    
-    // 如果获取失败，发送基础信息
-    let fallbackMsg = "📊 使用统计\n\n暂无统计数据。";
-    if (dailyLimit > 0 || tokenLimit > 0) {
-      fallbackMsg += "\n\n使用限制：\n";
-      if (dailyLimit > 0) fallbackMsg += `• 每日消息上限：${dailyLimit} 条\n`;
-      if (tokenLimit > 0) fallbackMsg += `• 每日 Token 上限：${tokenLimit.toLocaleString()}\n`;
-    }
-    await sendCustomMessage(account, openId, fallbackMsg);
-    return;
   }
 
   if (eventKey === "CMD_ARTICLES") {
@@ -560,7 +607,7 @@ export async function handleMenuClick(
 
   // 检查是否是特殊命令（配对、状态等）
   if (command === "配对" || command === "状态") {
-    await handleSpecialCommand(account, openId, command);
+    await handleSpecialCommand(account, openId, command, agentConfigByAccountId);
     return;
   }
 
@@ -568,37 +615,34 @@ export async function handleMenuClick(
   const paired = isPaired(account.accountId, openId);
   const agentCfg = getAgentConfig(account.accountId, agentConfigByAccountId);
   const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
-  const sessionKey = `wemp:${agentId}:${account.accountId}:${openId}`;
+  const commandToken = command.trim().split(/\s+/u)[0]?.toLowerCase() ?? command.toLowerCase();
+  const safeCommands = new Set<string>([
+    "/help",
+    "/commands",
+    "/status",
+    "/new",
+    "/reset",
+    "/clear",
+    "/undo",
+    "/usage",
+    "/stop",
+  ]);
+  const forceCommandAuthorized = paired || safeCommands.has(commandToken);
 
-  // 对于 OpenClaw 内置命令，通过 dispatchControlCommand 处理
-  const dispatchControlCommand = runtime?.channel?.commands?.dispatchControlCommand;
-  const isControlCommandMessage = runtime?.channel?.commands?.isControlCommandMessage;
-
-  if (dispatchControlCommand && isControlCommandMessage) {
-    const isControlCmd = isControlCommandMessage(command, cfg);
-    if (isControlCmd) {
-      try {
-        const result = await dispatchControlCommand({
-          command,
-          cfg,
-          channel: "wemp",
-          accountId: account.accountId,
-          sessionKey,
-          senderId: openId,
-          agentId,
-          deliver: async (response: string) => {
-            await sendCustomMessage(account, openId, response);
-          },
-        });
-        if (result?.handled) {
-          return;
-        }
-      } catch (err) {
-        console.warn(`[wemp:${account.accountId}] 菜单命令处理失败:`, err);
-      }
-    }
-  }
-
-  // 如果命令未被处理，发送提示
-  await sendCustomMessage(account, openId, `命令 ${command} 暂不支持。`);
+  // 统一走消息分发流程，让 OpenClaw 自己处理 /new、/clear、/help 等内置命令。
+  // 这样避免依赖不存在的 runtime.channel.commands.dispatchControlCommand。
+  const now = Date.now();
+  await dispatchWempMessage({
+    account,
+    openId,
+    text: command,
+    messageId: `menu:${eventKey}:${now}`,
+    timestamp: now,
+    agentId,
+    cfg,
+    runtime,
+    commandAuthorized: paired,
+    forceCommandAuthorized,
+    usageLimitIgnore: true,
+  });
 }

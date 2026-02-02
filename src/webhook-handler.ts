@@ -18,6 +18,7 @@ import { handlePairingApi } from "./pairing-api.js";
 import { dispatchWempMessage } from "./message-dispatcher.js";
 import { handleMenuClick, handleSpecialCommand } from "./menu-handler.js";
 import { isOk } from "./result.js";
+import { recordUsageLimitInbound } from "./usage-limit-tracker.js";
 import {
   isPaired,
   getPairedUser,
@@ -333,6 +334,17 @@ async function handleMessage(
     const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
     console.log(`[wemp:${account.accountId}] 用户 ${openId} 使用 agent: ${agentId} (${paired ? "已配对" : "未配对"})`);
 
+    // 配对用户视为"管理者"，不纳入 usageLimit 统计/限制
+    if (!paired) {
+      recordUsageLimitInbound({
+        accountId: account.accountId,
+        openId,
+        text: trimmed,
+        messageCount: 1,
+        now: parseInt(msg.createTime) * 1000 || Date.now(),
+      });
+    }
+
     // 检查是否有待处理的图片
     const pendingKey = `${account.accountId}:${openId}`;
     const pendingImage = pendingImages.get(pendingKey);
@@ -356,6 +368,8 @@ async function handleMessage(
       messageId: msg.msgId ?? `${msg.createTime}`,
       timestamp: parseInt(msg.createTime) * 1000 || Date.now(),
       agentId,
+      commandAuthorized: paired,
+      usageLimitIgnore: paired,
       cfg: storedConfig || cfg,
       runtime,
       imageFilePath,
@@ -419,6 +433,16 @@ async function handleMessage(
     const agentId = paired ? agentCfg.agentPaired : agentCfg.agentUnpaired;
     console.log(`[wemp:${account.accountId}] 用户 ${openId} 发送语音(识别), 使用 agent: ${agentId} (${paired ? "已配对" : "未配对"})`);
 
+    if (!paired) {
+      recordUsageLimitInbound({
+        accountId: account.accountId,
+        openId,
+        text: msg.recognition,
+        messageCount: 1,
+        now: parseInt(msg.createTime) * 1000 || Date.now(),
+      });
+    }
+
     await dispatchWempMessage({
       account,
       openId,
@@ -426,6 +450,8 @@ async function handleMessage(
       messageId: msg.msgId ?? `${msg.createTime}`,
       timestamp: parseInt(msg.createTime) * 1000 || Date.now(),
       agentId,
+      commandAuthorized: paired,
+      usageLimitIgnore: paired,
       cfg: storedConfig || cfg,
       runtime,
     });

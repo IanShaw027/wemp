@@ -12,19 +12,28 @@ const API_BASE = "https://api.weixin.qq.com";
 /**
  * 微信 API 响应的基础结构
  */
-interface WechatApiResponse {
+export interface WechatApiResponse {
   errcode?: number;
   errmsg?: string;
 }
 
 /**
+ * 微信 API 列表响应的基础结构
+ */
+export interface WechatListResponse<T = unknown> extends WechatApiResponse {
+  list?: T[];
+}
+
+/**
  * API 请求选项
  */
-interface ApiRequestOptions {
+export interface ApiRequestOptions {
   /** 请求超时时间（毫秒） */
   timeoutMs?: number;
   /** 是否使用 POST 方法（默认 true） */
   usePost?: boolean;
+  /** URL 查询参数 */
+  query?: Record<string, string | number | boolean | undefined>;
 }
 
 /**
@@ -45,7 +54,18 @@ export async function wechatApiRequest<T extends WechatApiResponse>(
 ): Promise<Result<T>> {
   try {
     const accessToken = await getAccessToken(account);
-    const url = `${API_BASE}${endpoint}?access_token=${accessToken}`;
+    const queryParams = new URLSearchParams({ access_token: accessToken });
+
+    // 添加额外的查询参数
+    if (options?.query) {
+      for (const [key, value] of Object.entries(options.query)) {
+        if (value !== undefined) {
+          queryParams.set(key, String(value));
+        }
+      }
+    }
+
+    const url = `${API_BASE}${endpoint}?${queryParams.toString()}`;
     const timeoutMs = options?.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
     const usePost = options?.usePost ?? true;
 
@@ -107,7 +127,7 @@ export async function wechatApiPost<T extends WechatApiResponse>(
  * 用于处理 { list: [...], errcode, errmsg } 格式的响应
  */
 export function extractList<T, R>(
-  data: { list?: T[] } & WechatApiResponse,
+  data: WechatListResponse<T>,
   mapper: (item: T) => R
 ): R[] {
   return data.list?.map(mapper) || [];

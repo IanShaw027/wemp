@@ -55,7 +55,7 @@ export async function aiCrop(
   });
 
   return map(result, (data) => (
-    data.results?.map((r) => ({
+    data.results?.map((r: { crop_left: number; crop_top: number; crop_right: number; crop_bottom: number }) => ({
       cropLeft: r.crop_left,
       cropTop: r.crop_top,
       cropRight: r.crop_right,

@@ -7,6 +7,42 @@ import { sendTypingStatus, sendCustomMessage, sendImageByUrl } from "./api.js";
 import { isOk } from "./result.js";
 import { processImagesInText } from "./image-processor.js";
 import { WECHAT_MESSAGE_TEXT_LIMIT, MAX_IMAGES_PER_MESSAGE } from "./constants.js";
+import { recordUsageLimitOutbound } from "./usage-limit-tracker.js";
+
+function replaceAgentIdInSessionKey(sessionKey: string, agentId: string): string {
+  const trimmedKey = (sessionKey ?? "").trim();
+  const trimmedAgent = (agentId ?? "").trim();
+  if (!trimmedKey || !trimmedAgent) {
+    return trimmedKey;
+  }
+  const loweredKey = trimmedKey.toLowerCase();
+  const loweredAgent = trimmedAgent.toLowerCase();
+  if (!loweredKey.startsWith("agent:")) {
+    return trimmedKey;
+  }
+  const parts = loweredKey.split(":");
+  if (parts.length < 2) {
+    return trimmedKey;
+  }
+  parts[1] = loweredAgent;
+  return parts.join(":");
+}
+
+function buildWempSessionKeyFallback(params: {
+  agentId: string;
+  accountId: string;
+  openId: string;
+}): { sessionKey: string; mainSessionKey: string } {
+  const agentId = (params.agentId ?? "").trim().toLowerCase() || "main";
+  const accountId = (params.accountId ?? "").trim().toLowerCase() || "default";
+  const openId = (params.openId ?? "").trim().toLowerCase() || "unknown";
+  // Use a stable OpenClaw-style key so /usage, /clear, /new, etc can resolve agent + session properly.
+  // We intentionally scope to per-peer to avoid cross-user context bleeding on public channels.
+  return {
+    sessionKey: `agent:${agentId}:wemp:${accountId}:dm:${openId}`,
+    mainSessionKey: `agent:${agentId}:main`,
+  };
+}
 
 /**
  * 使用 runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher 分发消息并获取 AI 回复
@@ -22,7 +58,11 @@ export async function dispatchWempMessage(params: {
   cfg: any;
   runtime: any;
   imageFilePath?: string;
-}): Promise<void> {
+  captureReplies?: boolean;
+  commandAuthorized?: boolean;
+  forceCommandAuthorized?: boolean;
+  usageLimitIgnore?: boolean;
+}): Promise<string | undefined> {
   const { account, openId, text, messageId, timestamp, cfg, runtime, imageFilePath } = params;
 
   // 从 runtime 获取需要的函数
@@ -36,43 +76,10 @@ export async function dispatchWempMessage(params: {
   const recordSessionMetaFromInbound = runtime.channel?.session?.recordSessionMetaFromInbound;
   const resolveStorePath = runtime.channel?.session?.resolveStorePath;
   const updateLastRoute = runtime.channel?.session?.updateLastRoute;
-  // 命令处理相关
-  const isControlCommandMessage = runtime.channel?.commands?.isControlCommandMessage;
-  const dispatchControlCommand = runtime.channel?.commands?.dispatchControlCommand;
 
   if (!dispatchReplyWithBufferedBlockDispatcher) {
     console.error(`[wemp:${account.accountId}] dispatchReplyWithBufferedBlockDispatcher not available in runtime`);
-    return;
-  }
-
-  // 0. 检查是否是内置命令（/help, /clear, /new 等）
-  if (isControlCommandMessage && dispatchControlCommand) {
-    const isControlCmd = isControlCommandMessage(text, cfg);
-    if (isControlCmd) {
-      console.log(`[wemp:${account.accountId}] 检测到内置命令: ${text}`);
-      try {
-        const agentIdForCmd = params.agentId;
-        const sessionKeyForCmd = `wemp:${agentIdForCmd}:${account.accountId}:${openId}`;
-        const result = await dispatchControlCommand({
-          command: text,
-          cfg,
-          channel: "wemp",
-          accountId: account.accountId,
-          sessionKey: sessionKeyForCmd,
-          senderId: openId,
-          agentId: agentIdForCmd,
-          deliver: async (response: string) => {
-            await sendCustomMessage(account, openId, response);
-          },
-        });
-        if (result?.handled) {
-          console.log(`[wemp:${account.accountId}] 内置命令已处理`);
-          return;
-        }
-      } catch (err) {
-        console.warn(`[wemp:${account.accountId}] 内置命令处理失败:`, err);
-      }
-    }
+    return undefined;
   }
 
   // 1. 记录渠道活动
@@ -87,13 +94,13 @@ export async function dispatchWempMessage(params: {
   }
 
   // 2. 解析路由 - 但保留我们基于配对状态的 agentId
-  const agentId = params.agentId; // 保留传入的 agentId（基于配对状态）
+  const agentIdRaw = params.agentId; // 保留传入的 agentId（基于配对状态）
+  const agentId = agentIdRaw.trim().toLowerCase() || "main";
+  const openIdLower = openId.toLowerCase();
 
-  // 构建 sessionKey - 包含 agentId 以区分不同 agent 的会话
-  let sessionKey = `wemp:${agentId}:${account.accountId}:${openId}`;
-  let mainSessionKey = `wemp:${account.accountId}:${openId}`;
+  let sessionKey: string | undefined;
+  let mainSessionKey: string | undefined;
 
-  // 尝试使用 resolveAgentRoute 获取更多路由信息，但不覆盖 agentId
   if (resolveAgentRoute) {
     try {
       const route = resolveAgentRoute({
@@ -102,21 +109,39 @@ export async function dispatchWempMessage(params: {
         accountId: account.accountId,
         peer: {
           kind: "dm",
-          id: openId,
+          id: openIdLower,
         },
       });
-      // 只使用 route 的 mainSessionKey 格式，但保留我们的 agentId
-      if (route.mainSessionKey) {
-        mainSessionKey = route.mainSessionKey;
-      }
-      // sessionKey 需要包含我们的 agentId
-      sessionKey = `wemp:${agentId}:${account.accountId}:${openId}`;
+      const routeKey = typeof route?.sessionKey === "string" ? route.sessionKey : "";
+      const routeMainKey = typeof route?.mainSessionKey === "string" ? route.mainSessionKey : "";
+      // Some configs (dmScope="main") collapse DM sessions to agent:<id>:main; that is unsafe for public channels
+      // like WeChat MP because it can cross-contaminate user context. Force per-peer scoping for wemp.
+      const looksPerPeer = routeKey.includes(":dm:");
+      const fallback = buildWempSessionKeyFallback({
+        agentId,
+        accountId: account.accountId,
+        openId: openIdLower,
+      });
+      sessionKey = replaceAgentIdInSessionKey(looksPerPeer ? routeKey : fallback.sessionKey, agentId);
+      mainSessionKey = replaceAgentIdInSessionKey(routeMainKey || fallback.mainSessionKey, agentId);
     } catch (err) {
       console.warn(`[wemp:${account.accountId}] resolveAgentRoute failed:`, err);
     }
   }
 
-  console.log(`[wemp:${account.accountId}] 路由: agentId=${agentId}, sessionKey=${sessionKey}`);
+  if (!sessionKey || !mainSessionKey) {
+    const fallback = buildWempSessionKeyFallback({
+      agentId,
+      accountId: account.accountId,
+      openId: openIdLower,
+    });
+    sessionKey = fallback.sessionKey;
+    mainSessionKey = fallback.mainSessionKey;
+  }
+
+  console.log(
+    `[wemp:${account.accountId}] 路由: agentId=${agentId}, sessionKey=${sessionKey}, mainSessionKey=${mainSessionKey}`,
+  );
 
   // 3. 构建消息信封
   const fromAddress = `wemp:${openId}`;
@@ -147,6 +172,7 @@ export async function dispatchWempMessage(params: {
   }
 
   // 4. 构建 inbound context
+  const commandAuthorized = params.forceCommandAuthorized === true || params.commandAuthorized === true;
   let ctx: any = {
     Body: body,
     RawBody: messageText,
@@ -164,6 +190,7 @@ export async function dispatchWempMessage(params: {
     Timestamp: timestamp,
     OriginatingChannel: "wemp",
     OriginatingTo: fromAddress,
+    CommandAuthorized: commandAuthorized,
     // 指定 agent ID - 这是关键！
     AgentId: agentId,
   };
@@ -220,12 +247,29 @@ export async function dispatchWempMessage(params: {
   }
 
   // 7. 分发消息并获取回复
+  const captureReplies = params.captureReplies === true;
+  const usageLimitIgnore = params.usageLimitIgnore === true;
+  let capturedText = "";
   try {
     const { queuedFinal } = await dispatchReplyWithBufferedBlockDispatcher({
       ctx,
       cfg,
       dispatcherOptions: {
-        deliver: async (payload: any) => {
+        deliver: async (payload: any, info: { kind: "tool" | "block" | "final" }) => {
+          if (captureReplies) {
+            if (info?.kind !== "final") {
+              return;
+            }
+            const piece = String(payload?.text ?? payload?.content ?? "").trim();
+            if (piece) {
+              capturedText = capturedText ? `${capturedText}\n${piece}` : piece;
+            }
+            return;
+          }
+          if (info?.kind !== "final") {
+            return;
+          }
+
           // 发送正在输入状态
           sendTypingStatus(account, openId).catch(() => {});
 
@@ -233,7 +277,8 @@ export async function dispatchWempMessage(params: {
           let replyText = payload.text || payload.content || "";
 
           // 从文本中提取图片 URL
-          const { text: processedText, imageUrls: extractedImageUrls } = processImagesInText(replyText);
+          const { text: processedText, imageUrls: extractedImageUrls } =
+            processImagesInText(replyText);
           replyText = processedText;
 
           if (replyText) {
@@ -255,11 +300,22 @@ export async function dispatchWempMessage(params: {
               }
             }
 
+            let sentTextChunks = 0;
             // 发送每个分块
             for (const chunk of chunks) {
               if (chunk.trim()) {
                 await sendCustomMessage(account, openId, chunk);
+                sentTextChunks += 1;
               }
+            }
+
+            if (!usageLimitIgnore && sentTextChunks > 0) {
+              recordUsageLimitOutbound({
+                accountId: account.accountId,
+                openId,
+                text: replyText,
+                messageCount: sentTextChunks,
+              });
             }
           }
 
@@ -268,16 +324,29 @@ export async function dispatchWempMessage(params: {
           const allImageUrls = [...payloadMediaUrls, ...extractedImageUrls];
 
           // 发送图片（限制数量）
+          let imagesSent = 0;
           for (const imageUrl of allImageUrls.slice(0, MAX_IMAGES_PER_MESSAGE)) {
             if (imageUrl) {
               try {
                 const result = await sendImageByUrl(account, openId, imageUrl);
                 if (!isOk(result)) {
                   console.warn(`[wemp:${account.accountId}] 发送图片失败: ${result.error}`);
+                } else {
+                  imagesSent += 1;
                 }
               } catch (err) {
                 console.warn(`[wemp:${account.accountId}] 发送图片异常: ${err}`);
               }
+            }
+          }
+          if (imagesSent > 0) {
+            if (!usageLimitIgnore) {
+              recordUsageLimitOutbound({
+                accountId: account.accountId,
+                openId,
+                text: "",
+                messageCount: imagesSent,
+              });
             }
           }
 
@@ -303,6 +372,10 @@ export async function dispatchWempMessage(params: {
   } catch (err) {
     console.error(`[wemp:${account.accountId}] 消息分发失败:`, err);
     // 发送错误消息
-    await sendCustomMessage(account, openId, "抱歉，处理消息时出现错误，请稍后再试。");
+    if (!captureReplies) {
+      await sendCustomMessage(account, openId, "抱歉，处理消息时出现错误，请稍后再试。");
+    }
   }
+
+  return captureReplies ? (capturedText.trim() || undefined) : undefined;
 }
