@@ -2,6 +2,7 @@
  * 微信公众号 API 封装
  */
 import type { ResolvedWechatMpAccount } from "./types.js";
+import { makeMenuPayloadId, upsertMenuPayload, type MenuPayload } from "./menu-payload.js";
 import * as crypto from "node:crypto";
 import * as dns from "node:dns/promises";
 import * as net from "node:net";
@@ -429,6 +430,99 @@ export async function sendImageMessage(
 }
 
 /**
+ * 发送客服消息（语音）
+ * 需要先上传语音素材获取 media_id
+ */
+export async function sendVoiceMessage(
+  account: ResolvedWechatMpAccount,
+  openId: string,
+  mediaId: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${accessToken}`;
+
+    const response = await safeFetch(
+      url,
+      {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        touser: openId,
+        msgtype: "voice",
+        voice: { media_id: mediaId },
+      }),
+      },
+      { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+    );
+
+    const data = await response.json() as { errcode?: number; errmsg?: string };
+
+    if (data.errcode && data.errcode !== 0) {
+      return { success: false, error: `${data.errcode} - ${data.errmsg}` };
+    }
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * 发送客服消息（视频）
+ * 需要先上传视频素材获取 media_id
+ */
+export async function sendVideoMessage(
+  account: ResolvedWechatMpAccount,
+  openId: string,
+  mediaId: string,
+  options?: {
+    thumbMediaId?: string;
+    title?: string;
+    description?: string;
+  }
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    // 微信客服消息的视频通常需要 thumb_media_id，否则会报参数错误
+    if (!options?.thumbMediaId) {
+      return { success: false, error: "缺少 thumbMediaId（微信视频客服消息通常需要缩略图）" };
+    }
+
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${accessToken}`;
+
+    const videoPayload: any = { media_id: mediaId };
+    videoPayload.thumb_media_id = options.thumbMediaId;
+    if (options?.title) videoPayload.title = options.title;
+    if (options?.description) videoPayload.description = options.description;
+
+    const response = await safeFetch(
+      url,
+      {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        touser: openId,
+        msgtype: "video",
+        video: videoPayload,
+      }),
+      },
+      { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+    );
+
+    const data = await response.json() as { errcode?: number; errmsg?: string };
+
+    if (data.errcode && data.errcode !== 0) {
+      return { success: false, error: `${data.errcode} - ${data.errmsg}` };
+    }
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
  * 发送客服消息（图片，通过 URL）
  * 自动上传并发送
  */
@@ -522,6 +616,288 @@ export async function sendTypingStatus(
   }
 }
 
+// ============ 素材管理 API ============
+
+/**
+ * 下载临时素材
+ * 用于获取后台设置的临时素材内容
+ */
+export async function getTempMedia(
+  account: ResolvedWechatMpAccount,
+  mediaId: string
+): Promise<{ success: boolean; data?: Buffer; contentType?: string; error?: string }> {
+  try {
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/media/get?access_token=${accessToken}&media_id=${mediaId}`;
+
+    const response = await safeFetch(url, undefined, { timeoutMs: 30000 });
+
+    const contentType = response.headers.get("content-type") || "";
+    const normalizedType = contentType.split(";")[0].trim() || "application/octet-stream";
+
+    // 注意：response body 只能读取一次。这里按 content-type 决定读取 text 还是 bytes。
+    const isTextLike = contentType.includes("application/json") || contentType.startsWith("text/");
+    if (isTextLike) {
+      const text = await response.text();
+      try {
+        const data = JSON.parse(text) as { errcode?: number; errmsg?: string };
+        if (data.errcode) return { success: false, error: `${data.errcode} - ${data.errmsg}` };
+      } catch {
+        // ignore
+      }
+      const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+      return { success: false, error: `获取素材失败：意外返回文本响应 (${normalizedType}): ${snippet}` };
+    }
+
+    const bytes = await readResponseBytesWithLimit(response, 20 * 1024 * 1024); // 20MB limit
+    return { success: true, data: Buffer.from(bytes), contentType: normalizedType };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * 下载永久素材
+ * 用于获取后台设置的永久素材内容（语音、视频等）
+ */
+export async function getPermanentMedia(
+  account: ResolvedWechatMpAccount,
+  mediaId: string
+): Promise<{ success: boolean; data?: Buffer; contentType?: string; error?: string }> {
+  try {
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/material/get_material?access_token=${accessToken}`;
+
+    const response = await safeFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ media_id: mediaId }),
+    }, { timeoutMs: 30000 });
+
+    const contentType = response.headers.get("content-type") || "";
+    const normalizedType = contentType.split(";")[0].trim() || "application/octet-stream";
+
+    // 注意：response body 只能读取一次。对 get_material 来说，JSON 既可能是错误也可能是图文结构。
+    const isTextLike = contentType.includes("application/json") || contentType.startsWith("text/");
+    if (isTextLike) {
+      const text = await response.text();
+      try {
+        const data = JSON.parse(text) as { errcode?: number; errmsg?: string };
+        if (data.errcode) return { success: false, error: `${data.errcode} - ${data.errmsg}` };
+      } catch {
+        // ignore
+      }
+      const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+      return { success: false, error: `获取永久素材失败：该素材可能为图文或接口返回了非二进制响应 (${normalizedType}): ${snippet}` };
+    }
+
+    const bytes = await readResponseBytesWithLimit(response, 20 * 1024 * 1024); // 20MB limit
+    return { success: true, data: Buffer.from(bytes), contentType: normalizedType };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * 智能下载素材（先尝试临时素材，失败后尝试永久素材）
+ */
+export async function getMedia(
+  account: ResolvedWechatMpAccount,
+  mediaId: string
+): Promise<{ success: boolean; data?: Buffer; contentType?: string; error?: string }> {
+  // 先尝试临时素材 API
+  const tempResult = await getTempMedia(account, mediaId);
+  if (tempResult.success) {
+    console.log(`[wemp] 通过临时素材 API 下载成功: ${mediaId.substring(0, 20)}...`);
+    return tempResult;
+  }
+
+  // 临时素材失败，尝试永久素材 API
+  console.log(`[wemp] 临时素材 API 失败 (${tempResult.error})，尝试永久素材 API...`);
+  const permResult = await getPermanentMedia(account, mediaId);
+  if (permResult.success) {
+    console.log(`[wemp] 通过永久素材 API 下载成功: ${mediaId.substring(0, 20)}...`);
+    return permResult;
+  }
+
+  return { success: false, error: `临时素材: ${tempResult.error}; 永久素材: ${permResult.error}` };
+}
+
+/**
+ * 上传永久素材
+ * 返回永久 media_id，不会过期
+ */
+export async function uploadPermanentMedia(
+  account: ResolvedWechatMpAccount,
+  mediaData: Buffer,
+  type: "image" | "voice" | "video" | "thumb",
+  options?: {
+    filename?: string;
+    contentType?: string;
+    title?: string;       // video 类型必填
+    introduction?: string; // video 类型必填
+  }
+): Promise<{ success: boolean; mediaId?: string; url?: string; error?: string }> {
+  try {
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/material/add_material?access_token=${accessToken}&type=${type}`;
+
+    // 确定文件名和 content type
+    const filename = options?.filename || `media.${type === "image" ? "jpg" : type === "voice" ? "mp3" : type === "video" ? "mp4" : "jpg"}`;
+    const contentType = options?.contentType || (type === "image" ? "image/jpeg" : type === "voice" ? "audio/mp3" : type === "video" ? "video/mp4" : "image/jpeg");
+
+    // 构建 multipart/form-data
+    const boundary = "----WebKitFormBoundary" + Math.random().toString(36).slice(2);
+    const bodyParts: Uint8Array[] = [];
+
+    // 添加媒体文件字段
+    const header = `--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${filename}"\r\nContent-Type: ${contentType}\r\n\r\n`;
+    bodyParts.push(new TextEncoder().encode(header));
+    bodyParts.push(new Uint8Array(mediaData));
+    bodyParts.push(new TextEncoder().encode("\r\n"));
+
+    // 视频类型需要额外的描述字段
+    if (type === "video" && (options?.title || options?.introduction)) {
+      const description = JSON.stringify({
+        title: options.title || "视频",
+        introduction: options.introduction || "",
+      });
+      const descHeader = `--${boundary}\r\nContent-Disposition: form-data; name="description"\r\n\r\n`;
+      bodyParts.push(new TextEncoder().encode(descHeader));
+      bodyParts.push(new TextEncoder().encode(description));
+      bodyParts.push(new TextEncoder().encode("\r\n"));
+    }
+
+    bodyParts.push(new TextEncoder().encode(`--${boundary}--\r\n`));
+
+    // 合并所有部分
+    const totalLength = bodyParts.reduce((sum, part) => sum + part.length, 0);
+    const body = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const part of bodyParts) {
+      body.set(part, offset);
+      offset += part.length;
+    }
+
+    const response = await safeFetch(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body,
+      },
+      { timeoutMs: 60000 } // 永久素材上传可能较慢
+    );
+
+    const data = await response.json() as {
+      media_id?: string;
+      url?: string;
+      errcode?: number;
+      errmsg?: string;
+    };
+
+    if (data.errcode && data.errcode !== 0) {
+      return { success: false, error: `上传失败: ${data.errcode} - ${data.errmsg}` };
+    }
+
+    return {
+      success: true,
+      mediaId: data.media_id,
+      url: data.url, // 图片类型会返回 URL
+    };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * 将素材转换为永久素材
+ * 智能下载素材（先尝试临时素材API，失败后尝试永久素材API）并重新上传为永久素材
+ */
+export async function convertToPermanentMedia(
+  account: ResolvedWechatMpAccount,
+  mediaId: string,
+  type: "image" | "voice" | "video" | "thumb",
+  options?: {
+    title?: string;
+    introduction?: string;
+  }
+): Promise<{ success: boolean; mediaId?: string; error?: string }> {
+  // 1. 智能下载素材（先尝试临时素材，失败后尝试永久素材）
+  const downloadResult = await getMedia(account, mediaId);
+  if (!downloadResult.success || !downloadResult.data) {
+    return { success: false, error: `下载素材失败: ${downloadResult.error}` };
+  }
+
+  // 2. 上传为永久素材
+  const uploadResult = await uploadPermanentMedia(account, downloadResult.data, type, {
+    contentType: downloadResult.contentType,
+    title: options?.title,
+    introduction: options?.introduction,
+  });
+
+  if (!uploadResult.success || !uploadResult.mediaId) {
+    return { success: false, error: `上传永久素材失败: ${uploadResult.error}` };
+  }
+
+  return { success: true, mediaId: uploadResult.mediaId };
+}
+
+/**
+ * 将临时素材转换为永久素材（兼容旧接口）
+ * @deprecated 请使用 convertToPermanentMedia
+ */
+export async function convertTempToPermanentMedia(
+  account: ResolvedWechatMpAccount,
+  tempMediaId: string,
+  type: "image" | "voice" | "video" | "thumb",
+  options?: {
+    title?: string;
+    introduction?: string;
+  }
+): Promise<{ success: boolean; mediaId?: string; error?: string }> {
+  return convertToPermanentMedia(account, tempMediaId, type, options);
+}
+
+// 永久素材 ID 缓存（临时素材 ID -> 永久素材 ID）
+const permanentMediaCache = new Map<string, { mediaId: string; createdAt: number }>();
+
+/**
+ * 获取或创建永久素材
+ * 如果已缓存则返回缓存的永久素材 ID，否则转换并缓存
+ */
+export async function getOrCreatePermanentMedia(
+  account: ResolvedWechatMpAccount,
+  tempMediaId: string,
+  type: "image" | "voice" | "video" | "thumb",
+  options?: {
+    title?: string;
+    introduction?: string;
+  }
+): Promise<{ success: boolean; mediaId?: string; error?: string }> {
+  const cacheKey = `${account.accountId}:${type}:${tempMediaId}`;
+
+  // 检查缓存
+  const cached = permanentMediaCache.get(cacheKey);
+  if (cached) {
+    return { success: true, mediaId: cached.mediaId };
+  }
+
+  // 转换素材
+  const result = await convertTempToPermanentMedia(account, tempMediaId, type, options);
+  if (result.success && result.mediaId) {
+    // 缓存结果（永久素材不会过期）
+    permanentMediaCache.set(cacheKey, {
+      mediaId: result.mediaId,
+      createdAt: Date.now(),
+    });
+  }
+
+  return result;
+}
+
 /**
  * 下载图片并转换为 data URL
  */
@@ -604,10 +980,12 @@ export const __internal = {
  * 菜单按钮类型
  */
 export interface MenuButton {
-  type?: "click" | "view" | "scancode_push" | "scancode_waitmsg" | "pic_sysphoto" | "pic_photo_or_album" | "pic_weixin" | "location_select" | "media_id" | "article_id" | "article_view_limited";
+  type?: "click" | "view" | "miniprogram" | "scancode_push" | "scancode_waitmsg" | "pic_sysphoto" | "pic_photo_or_album" | "pic_weixin" | "location_select" | "media_id" | "article_id" | "article_view_limited";
   name: string;
   key?: string;      // click 类型必填
   url?: string;      // view 类型必填
+  appid?: string;    // miniprogram 类型必填
+  pagepath?: string; // miniprogram 类型必填
   media_id?: string; // media_id 类型必填
   article_id?: string; // article_id 类型必填
   sub_button?: MenuButton[]; // 子菜单
@@ -711,17 +1089,8 @@ export function createOpenClawDefaultMenu(customMenu?: MenuButton): Menu {
         { type: "click", name: "访问官网", key: "CMD_WEBSITE" },
       ],
     },
-    // 菜单二：AI 助手（核心对话功能）
-    {
-      name: "AI助手",
-      sub_button: [
-        { type: "click", name: "新对话", key: "CMD_NEW" },
-        { type: "click", name: "清除上下文", key: "CMD_CLEAR" },
-        { type: "click", name: "帮助", key: "CMD_HELP" },
-        { type: "click", name: "配对账号", key: "CMD_PAIR" },
-        { type: "click", name: "查看状态", key: "CMD_STATUS" },
-      ],
-    },
+    // 菜单二：AI 助手（包含开关）
+    createAiAssistantMenu(),
   ];
 
   // 菜单三：更多（用户自定义或默认）
@@ -771,4 +1140,292 @@ export function createMenuFromConfig(cfg: any): Menu {
   // 否则使用默认菜单 + 可选的自定义第三菜单
   const customMenuConfig = wempCfg?.customMenu as MenuButton | undefined;
   return createOpenClawDefaultMenu(customMenuConfig);
+}
+
+// ============ 菜单同步功能 ============
+
+/**
+ * 后台菜单按钮格式（get_current_selfmenu_info 返回的格式）
+ *
+ * 官网设置的菜单类型：
+ * - text: 发送消息（文字），value 保存文字内容
+ * - img: 发送消息（图片），value 保存 mediaID
+ * - voice: 发送消息（语音），value 保存 mediaID
+ * - video: 发送消息（视频），value 保存视频下载链接
+ * - news: 发送消息（已发表内容/图文消息），value 保存 mediaID，news_info 保存图文详情
+ * - view: 跳转网页，url 保存链接
+ *
+ * API 设置的菜单类型：
+ * - click: 点击事件，key 保存事件 key
+ * - view: 跳转网页，url 保存链接
+ */
+interface BackendMenuButton {
+  type?: string;
+  name: string;
+  value?: string;      // text/img/voice/video/news 类型的值
+  url?: string;        // view 类型的 URL
+  appid?: string;      // miniprogram 类型的 appid
+  pagepath?: string;   // miniprogram 类型的页面路径
+  key?: string;        // click 类型的 key
+  news_info?: {        // news 类型的图文消息详情
+    list: Array<{
+      title: string;
+      author?: string;
+      digest?: string;
+      show_cover?: number;
+      cover_url?: string;
+      content_url?: string;
+      source_url?: string;
+    }>;
+  };
+  sub_button?: {
+    list: BackendMenuButton[];
+  };
+}
+
+/**
+ * 获取当前自定义菜单配置（包括后台创建的菜单）
+ */
+export async function getCurrentSelfMenuInfo(
+  account: ResolvedWechatMpAccount
+): Promise<{ success: boolean; isOpen?: boolean; buttons?: BackendMenuButton[]; error?: string }> {
+  try {
+    const accessToken = await getAccessToken(account);
+    const url = `https://api.weixin.qq.com/cgi-bin/get_current_selfmenu_info?access_token=${accessToken}`;
+
+    const response = await fetch(url);
+    const data = await response.json() as {
+      is_menu_open?: number;
+      selfmenu_info?: { button: BackendMenuButton[] };
+      errcode?: number;
+      errmsg?: string;
+    };
+
+    if (data.errcode && data.errcode !== 0) {
+      return { success: false, error: `${data.errcode} - ${data.errmsg}` };
+    }
+
+    return {
+      success: true,
+      isOpen: data.is_menu_open === 1,
+      buttons: data.selfmenu_info?.button || [],
+    };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * 将后台菜单格式转换为 API 格式
+ * 支持素材转换：img → media_id, news → view, voice → click（尝试发送语音）
+ */
+async function convertBackendButtonToApiFormat(
+  btn: BackendMenuButton,
+  account: ResolvedWechatMpAccount
+): Promise<MenuButton | null> {
+  const result: MenuButton = { name: btn.name };
+  const accountId = account.accountId;
+
+  // 处理子菜单
+  if (btn.sub_button?.list && btn.sub_button.list.length > 0) {
+    const subResults = await Promise.all(
+      btn.sub_button.list.map((sub) => convertBackendButtonToApiFormat(sub, account))
+    );
+    const subButtons = subResults.filter((b): b is MenuButton => b !== null);
+    if (subButtons.length === 0) return null;
+    result.sub_button = subButtons;
+    return result;
+  }
+
+  // 辅助函数：创建 click 类型菜单
+  const createClickButton = (payload: MenuPayload, prefix: string): MenuButton => {
+    const id = makeMenuPayloadId(accountId, payload);
+    upsertMenuPayload(accountId, id, payload);
+    return { ...result, type: "click", key: `${prefix}_${id}` };
+  };
+
+  switch (btn.type) {
+    case "text":
+      return createClickButton({ kind: "text", text: btn.value || "" }, "BACKEND_TEXT");
+
+    case "news": {
+      const contentUrl = btn.news_info?.list?.[0]?.content_url;
+      if (contentUrl) {
+        return { ...result, type: "view", url: contentUrl };
+      }
+      const title = btn.news_info?.list?.[0]?.title || btn.name;
+      return createClickButton({ kind: "news", title, contentUrl: "" }, "BACKEND_NEWS");
+    }
+
+    case "img":
+    case "photo":
+      if (btn.value) {
+        try {
+          const convertResult = await getOrCreatePermanentMedia(account, btn.value, "image");
+          if (convertResult.success && convertResult.mediaId) {
+            return { ...result, type: "media_id", media_id: convertResult.mediaId };
+          }
+        } catch {}
+      }
+      return createClickButton({ kind: "image", mediaId: btn.value || "" }, "BACKEND_IMG");
+
+    case "voice":
+    case "audio":
+      return createClickButton({ kind: "voice", mediaId: btn.value || "" }, "BACKEND_VOICE");
+
+    case "video":
+      if (btn.value && !btn.value.startsWith("http")) {
+        try {
+          const convertResult = await getOrCreatePermanentMedia(account, btn.value, "video", {
+            title: btn.name,
+            introduction: btn.name,
+          });
+          if (convertResult.success && convertResult.mediaId) {
+            return { ...result, type: "media_id", media_id: convertResult.mediaId };
+          }
+        } catch {}
+      }
+      return createClickButton({ kind: "video", value: btn.value || "" }, "BACKEND_VIDEO");
+
+    case "video_snap":
+    case "finder":
+      return createClickButton({ kind: "finder", value: btn.value || "" }, "BACKEND_FINDER");
+
+    case "view":
+      return { ...result, type: "view", url: btn.url };
+
+    case "miniprogram":
+      if (btn.appid && btn.pagepath) {
+        return {
+          ...result,
+          type: "miniprogram",
+          url: btn.url || "https://mp.weixin.qq.com",
+          appid: btn.appid,
+          pagepath: btn.pagepath,
+        };
+      }
+      if (btn.url) {
+        return { ...result, type: "view", url: btn.url };
+      }
+      return createClickButton(
+        { kind: "unknown", originalType: "miniprogram", key: btn.key, value: btn.value, url: btn.url },
+        "BACKEND_UNKNOWN"
+      );
+
+    case "click":
+      return { ...result, type: "click", key: btn.key || btn.value };
+
+    case "media_id":
+      return { ...result, type: "media_id", media_id: btn.value };
+
+    case "article_id":
+      return { ...result, type: "article_id", article_id: btn.value };
+
+    case "article_view_limited":
+      return { ...result, type: "article_view_limited", article_id: btn.value };
+
+    default:
+      if (btn.url) {
+        return { ...result, type: "view", url: btn.url };
+      }
+      if (btn.value || btn.key) {
+        return createClickButton(
+          { kind: "unknown", originalType: btn.type, key: btn.key, value: btn.value, url: btn.url },
+          "BACKEND_UNKNOWN"
+        );
+      }
+      return createClickButton(
+        { kind: "unknown", originalType: btn.type, key: btn.key, value: btn.value, url: btn.url },
+        "BACKEND_EMPTY"
+      );
+  }
+}
+
+/**
+ * AI 助手菜单配置
+ * 包含开启/关闭 AI 助手的按钮
+ */
+export function createAiAssistantMenu(): MenuButton {
+  return {
+    name: "AI助手",
+    sub_button: [
+      { type: "click", name: "开启AI助手", key: "CMD_AI_ENABLE" },
+      { type: "click", name: "关闭AI助手", key: "CMD_AI_DISABLE" },
+      { type: "click", name: "新对话", key: "CMD_NEW" },
+      { type: "click", name: "清除上下文", key: "CMD_CLEAR" },
+      { type: "click", name: "使用统计", key: "CMD_USAGE" },
+    ],
+  };
+}
+
+function hasAiAssistantMenu(buttons: MenuButton[]): boolean {
+  return buttons.some(btn => btn.name === "AI助手");
+}
+
+function compareMenus(menu1: MenuButton[], menu2: MenuButton[]): boolean {
+  const filter = (btns: MenuButton[]) => btns.filter(btn => btn.name !== "AI助手");
+  return JSON.stringify(filter(menu1)) === JSON.stringify(filter(menu2));
+}
+
+/**
+ * 同步菜单：读取后台菜单，添加 AI 助手，创建新菜单
+ */
+export async function syncMenuWithAiAssistant(
+  account: ResolvedWechatMpAccount,
+  _cfg?: any
+): Promise<{ success: boolean; action: "created" | "updated" | "unchanged" | "error"; message: string }> {
+  try {
+    // 获取当前后台菜单
+    const currentMenuResult = await getCurrentSelfMenuInfo(account);
+    if (!currentMenuResult.success) {
+      return { success: false, action: "error", message: `获取当前菜单失败: ${currentMenuResult.error}` };
+    }
+
+    const currentButtons = currentMenuResult.buttons || [];
+    console.log(`[wemp:${account.accountId}] 当前菜单: ${currentButtons.map(b => b.name).join(", ") || "无"}`);
+
+    // 获取 API 菜单（检查是否已有 AI 助手）
+    const apiMenuResult = await getMenu(account);
+    const hasApiMenu = apiMenuResult.success && apiMenuResult.menu?.button;
+
+    // 转换后台菜单为 API 格式
+    const filteredButtons = currentButtons.filter(btn => btn.name !== "AI助手");
+    const buttonResults = await Promise.all(
+      filteredButtons.map((btn) => convertBackendButtonToApiFormat(btn, account))
+    );
+    const businessButtons = buttonResults.filter((b): b is MenuButton => b !== null);
+
+    // 检查是否需要更新
+    if (hasApiMenu) {
+      const apiButtons = apiMenuResult.menu.button as MenuButton[];
+      if (hasAiAssistantMenu(apiButtons) && compareMenus(apiButtons, businessButtons)) {
+        return { success: true, action: "unchanged", message: "菜单无变化" };
+      }
+    }
+
+    // 构建新菜单：业务菜单 + AI 助手（微信最多支持 3 个一级菜单）
+    const aiAssistantMenu = createAiAssistantMenu();
+    const hasTruncation = businessButtons.length >= 3;
+    const newButtons = hasTruncation
+      ? [...businessButtons.slice(0, 2), aiAssistantMenu]
+      : [...businessButtons, aiAssistantMenu];
+
+    // 创建新菜单
+    const createResult = await createMenu(account, { button: newButtons });
+    if (!createResult.success) {
+      return { success: false, action: "error", message: `创建菜单失败: ${createResult.error}` };
+    }
+
+    const action = hasApiMenu ? "updated" : "created";
+    const menuNames = newButtons.map(b => b.name).join(", ");
+    const truncationNote = hasTruncation
+      ? `（注意：原一级菜单 ${businessButtons.length} 个，已保留前 2 个并追加 AI助手）`
+      : "";
+    console.log(`[wemp:${account.accountId}] 菜单${action === "created" ? "创建" : "更新"}成功: ${menuNames}`);
+
+    return { success: true, action, message: `菜单${action === "created" ? "创建" : "更新"}成功: ${menuNames}${truncationNote}` };
+  } catch (error) {
+    console.error(`[wemp:${account.accountId}] 同步菜单失败:`, error);
+    return { success: false, action: "error", message: `同步菜单失败: ${String(error)}` };
+  }
 }

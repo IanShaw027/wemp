@@ -16,6 +16,13 @@ export interface WechatMpChannelConfig {
   agentPaired?: string;      // 已配对用户使用的 Agent ID
   agentUnpaired?: string;    // 未配对用户使用的 Agent ID
   pairingApiToken?: string;  // 配对 API Token
+  // 菜单同步配置
+  syncMenu?: boolean;        // 是否启动时同步菜单（默认 false）
+  // AI 助手开关相关配置
+  welcomeMessage?: string;      // 用户关注后的欢迎消息
+  aiEnabledMessage?: string;    // AI 助手开启时的提示消息
+  aiDisabledMessage?: string;   // AI 助手关闭时的提示消息
+  aiDisabledHint?: string;      // AI 助手关闭状态下收到消息时的提示（设为空字符串可禁用）
 }
 
 export interface WechatMpAccountConfig {
