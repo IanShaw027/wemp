@@ -23,7 +23,7 @@ const plugin = {
 
     // 注册 Agent 工具
     registerWempTools(api);
-    logInfo(api.runtime, "[wemp] Registered 5 agent tools: wemp_draft, wemp_publish, wemp_comment, wemp_stats, wemp_user");
+    logInfo(api.runtime, "[wemp] Registered 7 agent tools: wemp_draft, wemp_publish, wemp_comment, wemp_stats, wemp_user, wemp_qrcode, wemp_template");
 
     // 启动时同步菜单（异步执行，不阻塞启动）
     // 只有显式开启 syncMenu: true 才会同步

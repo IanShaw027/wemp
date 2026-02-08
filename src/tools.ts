@@ -44,6 +44,14 @@ function error(message: string) {
   };
 }
 
+function resolveConfiguredAccount(cfg: any) {
+  const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+  if (!account?.appId || !account?.appSecret || !account?.token) {
+    return null;
+  }
+  return account;
+}
+
 /**
  * 注册草稿管理工具
  */
@@ -72,9 +80,9 @@ export function registerWempDraftTools(api: OpenclawPluginApi) {
         count: Type.Optional(Type.Number({ description: "每页数量（list 时使用）", default: 20 })),
       }),
       async execute(_id: string, params: any) {
-        const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+        const account = resolveConfiguredAccount(cfg);
         if (!account) {
-          return error("微信公众号未配置");
+          return error("微信公众号未完整配置（需 appId、appSecret、token）");
         }
 
         try {
@@ -85,9 +93,9 @@ export function registerWempDraftTools(api: OpenclawPluginApi) {
               return json({
                 total: result.data.totalCount,
                 items: result.data.items?.map((item: any) => ({
-                  media_id: item.media_id,
-                  title: item.content?.news_item?.[0]?.title,
-                  update_time: item.update_time,
+                  media_id: item.mediaId,
+                  title: item.articles?.[0]?.title,
+                  update_time: item.updateTime,
                 })),
               });
             }
@@ -167,9 +175,9 @@ export function registerWempPublishTools(api: OpenclawPluginApi) {
         count: Type.Optional(Type.Number({ description: "每页数量", default: 20 })),
       }),
       async execute(_id: string, params: any) {
-        const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+        const account = resolveConfiguredAccount(cfg);
         if (!account) {
-          return error("微信公众号未配置");
+          return error("微信公众号未完整配置（需 appId、appSecret、token）");
         }
 
         try {
@@ -238,9 +246,9 @@ export function registerWempCommentTools(api: OpenclawPluginApi) {
         type: Type.Optional(Type.Number({ description: "评论类型：0-全部 1-普通 2-精选", default: 0 })),
       }),
       async execute(_id: string, params: any) {
-        const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+        const account = resolveConfiguredAccount(cfg);
         if (!account) {
-          return error("微信公众号未配置");
+          return error("微信公众号未完整配置（需 appId、appSecret、token）");
         }
 
         try {
@@ -331,9 +339,9 @@ export function registerWempStatsTools(api: OpenclawPluginApi) {
         end_date: Type.String({ description: "结束日期 YYYY-MM-DD（最多跨度 7 天）" }),
       }),
       async execute(_id: string, params: any) {
-        const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+        const account = resolveConfiguredAccount(cfg);
         if (!account) {
-          return error("微信公众号未配置");
+          return error("微信公众号未完整配置（需 appId、appSecret、token）");
         }
 
         try {
@@ -381,9 +389,9 @@ export function registerWempUserTools(api: OpenclawPluginApi) {
         next_openid: Type.Optional(Type.String({ description: "分页起始 OpenID（followers 时使用）" })),
       }),
       async execute(_id: string, params: any) {
-        const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+        const account = resolveConfiguredAccount(cfg);
         if (!account) {
-          return error("微信公众号未配置");
+          return error("微信公众号未完整配置（需 appId、appSecret、token）");
         }
 
         try {
@@ -445,9 +453,9 @@ export function registerWempQRCodeTools(api: OpenclawPluginApi) {
         ticket: Type.Optional(Type.String({ description: "二维码 ticket（get_url 时必填）" })),
       }),
       async execute(_id: string, params: any) {
-        const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+        const account = resolveConfiguredAccount(cfg);
         if (!account) {
-          return error("微信公众号未配置");
+          return error("微信公众号未完整配置（需 appId、appSecret、token）");
         }
 
         try {
@@ -516,9 +524,9 @@ export function registerWempTemplateTools(api: OpenclawPluginApi) {
         }, { description: "跳转小程序" })),
       }),
       async execute(_id: string, params: any) {
-        const account = resolveWechatMpAccount(cfg, DEFAULT_ACCOUNT_ID);
+        const account = resolveConfiguredAccount(cfg);
         if (!account) {
-          return error("微信公众号未配置");
+          return error("微信公众号未完整配置（需 appId、appSecret、token）");
         }
 
         try {
