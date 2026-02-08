@@ -56,7 +56,7 @@ function resolveConfiguredAccount(cfg: any) {
  * 注册草稿管理工具
  */
 export function registerWempDraftTools(api: OpenclawPluginApi) {
-  const cfg = (api as any).config;
+  const cfg = api.runtime.config;
 
   api.registerTool(
     {
@@ -157,7 +157,7 @@ export function registerWempDraftTools(api: OpenclawPluginApi) {
  * 注册发布管理工具
  */
 export function registerWempPublishTools(api: OpenclawPluginApi) {
-  const cfg = (api as any).config;
+  const cfg = api.runtime.config;
 
   api.registerTool(
     {
@@ -224,7 +224,7 @@ export function registerWempPublishTools(api: OpenclawPluginApi) {
  * 注册评论管理工具
  */
 export function registerWempCommentTools(api: OpenclawPluginApi) {
-  const cfg = (api as any).config;
+  const cfg = api.runtime.config;
 
   api.registerTool(
     {
@@ -324,7 +324,7 @@ export function registerWempCommentTools(api: OpenclawPluginApi) {
  * 注册数据统计工具
  */
 export function registerWempStatsTools(api: OpenclawPluginApi) {
-  const cfg = (api as any).config;
+  const cfg = api.runtime.config;
 
   api.registerTool(
     {
@@ -374,7 +374,7 @@ export function registerWempStatsTools(api: OpenclawPluginApi) {
  * 注册用户管理工具
  */
 export function registerWempUserTools(api: OpenclawPluginApi) {
-  const cfg = (api as any).config;
+  const cfg = api.runtime.config;
 
   api.registerTool(
     {
@@ -430,7 +430,7 @@ export function registerWempUserTools(api: OpenclawPluginApi) {
  * 注册二维码工具
  */
 export function registerWempQRCodeTools(api: OpenclawPluginApi) {
-  const cfg = (api as any).config;
+  const cfg = api.runtime.config;
 
   api.registerTool(
     {
@@ -500,7 +500,7 @@ export function registerWempQRCodeTools(api: OpenclawPluginApi) {
  * 注册模板消息工具
  */
 export function registerWempTemplateTools(api: OpenclawPluginApi) {
-  const cfg = (api as any).config;
+  const cfg = api.runtime.config;
 
   api.registerTool(
     {
