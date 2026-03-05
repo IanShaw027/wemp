@@ -19,7 +19,8 @@ const plugin = {
   register(api: OpenclawPluginApi) {
     setWechatMpRuntime(api.runtime);
     api.registerChannel({ plugin: wechatMpPlugin });
-    api.registerHttpHandler(handleWechatMpWebhookRequest);
+    // Note: Webhook handling is now done inside the channel plugin via registerWechatMpWebhookTarget
+    // api.registerHttpHandler is deprecated and removed in newer OpenClaw versions
 
     // 注册 Agent 工具
     registerWempTools(api);
